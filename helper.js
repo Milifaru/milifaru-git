@@ -134,12 +134,249 @@
   // ==== Вспомогательные ====
   const prefDataAttrs = ['data-testid','data-test','data-cy','data-qa','data-test-id','data-automation-id','for'];
   const okAttrs = ['id','name','type','placeholder','href','value','role','aria-label','title','for'];
-  const interestingSel = 'button, a, input, select, textarea, label, [role="button"], [role="menuitem"], .select2-container, .select2-choice, .select2-selection, .select2-selection__rendered';
+  const interestingSel = 'button, a, input, select, textarea, label, [role="button"], [role="menuitem"], .select2-container, .select2-choice, .select2-selection, .select2-selection__rendered, .select2-drop, .select2-results, .select2-result, .select2-result-label, .select2-results__option, .select2-input';
 
   const esc = (s) => CSS.escape(s);
   const looksDynamic = (s='') => /\b\d{4,}\b|\b[a-f0-9]{6,}\b|__/i.test(s);
+  const hasDigits = (s='') => /\d/.test(s);
+
+  // Конфиг весов (динамическая система рейтинга). Меняйте значения по необходимости.
+  // Пояснения к каждому параметру ниже.
+  const selectorWeights = {
+    // anchor_type: базовая «опорная» надёжность якоря селектора
+    // data-testid / data-qa: специальные тестовые атрибуты почти всегда стабильны
+    anchor_data_testid: 30,
+    // id без цифр: как правило статичен (семантические id)
+    anchor_id_no_digits: 25,
+    // комбо role+aria-label: доступности метки обычно осмысленные и стабильные
+    anchor_role_aria: 18,
+    // стабильный класс без цифр: хороший компромисс (подняли приоритет)
+    anchor_stable_class: 16,
+    // прочие атрибуты (href/title/name и т.п.) — слегка ниже класса
+    anchor_other_attr: 6,
+    // текст в контексте (уникален в scope)
+    anchor_text_scoped_unique: 10,
+    // текст глобально уникален
+    anchor_text_global_unique: 4,
+
+    // Штрафы за хрупкость / сложность
+    // Позиционные зависимые селекторы (структура DOM)
+    penalty_positional: -25,
+    // Абсолютный путь (полностью позиционный)
+    penalty_absolute_path: -40,
+    // Доля цифр в токенах (#id/.class/[attr]): от 0 до -20
+    penalty_digits_ratio_max: -20,
+    // Глубина пути: -3 за каждый уровень после 2
+    penalty_per_depth_after2: -3,
+    // Сложность: -2 за каждый атрибут/псевдо после первых двух
+    penalty_per_extra_complex: -2,
+    // Кол-во ссылок на элементы/сегменты пути: -2 за каждый сегмент после первого
+    penalty_per_element_ref_after1: -2,
+    // Использование :nth-* (доп. к positional)
+    penalty_uses_nth: -15,
+    // Риск текста (low 0, mid -6, high -15)
+    penalty_text_mid: -6,
+    penalty_text_high: -15,
+
+    // Качество контейнера (если есть явный scope)
+    // Уникальный стабильный контейнер (без цифр)
+    bonus_container_unique_stable: 15,
+    // Уникальный контейнер с цифрами
+    bonus_container_unique_with_digits: 6,
+    // Фильтр видимости / спец-контексты (модалки/datepicker)
+    bonus_visibility_context: 6,
+
+    // Соответствие действию (например, клик по ссылке/кнопке)
+    bonus_action_perfect: 10,
+    bonus_action_ok: 4,
+    penalty_action_poor: -6,
+
+    // Устойчивость fallback (более надёжные фоллбеки могут получить +)
+    bonus_fallback_low: 3,
+    bonus_fallback_mid: 6,
+    bonus_fallback_high: 12,
+    // Дополнительные поправки
+    // Бонус за "tag.class" для кликабельных элементов (простота и надёжность класса)
+    bonus_tag_class_clickable: 8,
+    // Штраф, если для кликабельного элемента опора идёт на атрибут (а не класс)
+    penalty_attr_clickable: -4,
+    // Штраф за комбинатор "+" (хрупкая связь с соседом)
+    penalty_combinator_plus: -4,
+  };
+
+  // --- Утилиты анализа селектора ---
+  const isCypressSelector = (item) => !!item.isCypress || /\bcy\./.test(item.sel);
+  const includesContains = (s) => /\.contains\(/.test(s) || /cy\.contains\(/.test(s);
+  const extractGetScope = (s) => {
+    const m = s.match(/cy\.get\(['"]([^'"]+)['"]\)/);
+    return m ? m[1] : null;
+  };
+  const tokensFromSelector = (s) => {
+    // Извлекаем критичные токены: #id, .class, [attr=value]
+    const idTokens = (s.match(/#[^\s>.:#\[]+/g) || []);
+    const classTokens = (s.match(/\.[^\s>.:#\[]+/g) || []);
+    const attrTokens = (s.match(/\[[^\]]+\]/g) || []);
+    return { idTokens, classTokens, attrTokens };
+  };
+  const elementRefCount = (s) => {
+    // Считаем число сегментов-элементов, разделённых комбинаторами пробел/>, +, ~
+    // Убираем лишние пробелы и служебные конструкции внутри []
+    const parts = s
+      .replace(/\[[^\]]+\]/g, '[]')
+      .split(/\s*[>+~]\s*|\s+/)
+      .filter(Boolean);
+    return Math.max(1, parts.length);
+  };
+  const digitsRatioInTokens = (s) => {
+    const { idTokens, classTokens, attrTokens } = tokensFromSelector(s);
+    const toks = [...idTokens, ...classTokens, ...attrTokens];
+    const joined = toks.join('');
+    if (joined.length === 0) return 0;
+    const digits = (joined.match(/\d/g) || []).length;
+    return digits / joined.length; // 0..1
+  };
+  const pathDepth = (s) => {
+    // Грубая оценка глубины: по разделителям '>' и пробелам между сегментами
+    const segments = s.split(/\s*>\s*|\s+/).filter(Boolean);
+    return Math.max(1, segments.length);
+  };
+  const complexityScore = (s) => {
+    // Количество атрибутов и псевдоклассов
+    const attrCount = (s.match(/\[[^\]]+\]/g) || []).length;
+    const pseudoCount = (s.match(/:[a-zA-Z-]+\b/g) || []).length;
+    const total = attrCount + pseudoCount;
+    return Math.max(0, total - 2); // сверх первых двух
+  };
+  const usesNth = (s) => /:nth-(?:child|of-type)\(\d+\)/.test(s) || /\.eq\(\d+\)/.test(s);
+  const isAbsolutePathLike = (s) => {
+    // Только теги, опционально :nth-of-type, с '>'/пробелами, без # . [ ]
+    if (/[#\.\[]/.test(s)) return false;
+    return /^\s*[a-z][a-z0-9-]*(?::nth-of-type\(\d+\))?(\s*>\s*[a-z][a-z0-9-]*(?::nth-of-type\(\d+\))?)*(\s*)$/.test(s);
+  };
+  const anchorTypeBonuses = (sel, targetEl) => {
+    let bonus = 0;
+    // data-testid / data-qa / data-cy
+    if (/\[(data-testid|data-qa|data-cy)=/.test(sel)) bonus += selectorWeights.anchor_data_testid;
+    // id без цифр
+    const idTokens = (sel.match(/#([a-zA-Z_-][a-zA-Z0-9_-]*)/g) || []);
+    if (idTokens.some(t => !/\d/.test(t))) bonus += selectorWeights.anchor_id_no_digits;
+    // role+aria-label
+    if (/\[role=/.test(sel) && /\[aria-label=/.test(sel)) bonus += selectorWeights.anchor_role_aria;
+    // стабильный класс без цифр
+    const classTokens = (sel.match(/\.([a-zA-Z_-][a-zA-Z0-9_-]*)/g) || []);
+    if (classTokens.some(t => !/\d/.test(t))) bonus += selectorWeights.anchor_stable_class;
+    // прочие атрибуты (href, title, name и т.п.)
+    if (/\[(id|name|type|placeholder|href|value|title|for)=/.test(sel)) bonus += selectorWeights.anchor_other_attr;
+    // текстовые варианты
+    if (includesContains(sel)) {
+      const scope = extractGetScope(sel);
+      if (scope) bonus += selectorWeights.anchor_text_scoped_unique;
+      else bonus += selectorWeights.anchor_text_global_unique;
+    }
+    return bonus;
+  };
+  const textRiskPenalty = (sel) => {
+    if (!includesContains(sel)) return 0;
+    const m = sel.match(/contains\(['"]([^'"]+)['"]\)/);
+    const txt = m ? m[1] : '';
+    if (!txt) return 0;
+    if (txt.length <= 25 && !/\d/.test(txt)) return 0; // low
+    if (txt.length <= 50) return selectorWeights.penalty_text_mid; // mid
+    return selectorWeights.penalty_text_high; // high
+  };
+  const containerQualityBonus = (sel) => {
+    const scope = extractGetScope(sel);
+    if (!scope) return 0;
+    // Условно считаем scope уникальным (мы строим только уникальные), оценим наличие цифр
+    const hasDigitsInScope = /\d/.test(scope);
+    return hasDigitsInScope
+      ? selectorWeights.bonus_container_unique_with_digits
+      : selectorWeights.bonus_container_unique_stable;
+  };
+  const visibilityContextBonus = (sel) => /:visible/.test(sel) || /\.modal|\.datepicker/.test(sel) ? selectorWeights.bonus_visibility_context : 0;
+  const actionFitScore = (sel, el) => {
+    const tag = el.tagName.toLowerCase();
+    const clickable = /^(a|button|input)$/i.test(tag) || el.getAttribute('role') === 'button';
+    if (!clickable) return selectorWeights.bonus_action_ok; // нейтрально-ок
+    // Если кликабельный элемент и селектор явно указывает на тег/класс этого элемента
+    const tagEnd = new RegExp(`${tag}(?![a-zA-Z0-9-])`);
+    if (tagEnd.test(sel) || /\.contains\(/.test(sel)) return selectorWeights.bonus_action_perfect;
+    // Явный уникальный ID без цифр (короткий, надёжный) — повышаем соответствие
+    if (/^cy\.get\('#[a-zA-Z_-][a-zA-Z_-]*'\)\s*$/.test(`cy.get('${sel}')`) && !/\d/.test(sel)) {
+      return selectorWeights.bonus_action_perfect;
+    }
+    // Предпочтение tag.class для кликабельных
+    if (new RegExp(`^${tag}\\.[a-zA-Z_-]`).test(sel) && !/\d/.test(sel)) {
+      return selectorWeights.bonus_tag_class_clickable;
+    }
+    // Если опора идёт на атрибут для кликабельного, снимаем немного баллов
+    if (/\[[^\]]+\]/.test(sel)) {
+      return selectorWeights.penalty_attr_clickable;
+    }
+    return selectorWeights.penalty_action_poor;
+  };
+  const fallbackResilienceBonus = (sel) => {
+    if (isAbsolutePathLike(sel)) return selectorWeights.bonus_fallback_low; // слабый
+    if (usesNth(sel)) return selectorWeights.bonus_fallback_low; // слабый
+    if (/\[(data-testid|data-qa|data-cy)=/.test(sel) || /\[role=/.test(sel)) return selectorWeights.bonus_fallback_high;
+    return selectorWeights.bonus_fallback_mid; // по умолчанию лёгкий бонус
+  };
+  const positionalPenalty = (sel) => usesNth(sel) ? selectorWeights.penalty_uses_nth + selectorWeights.penalty_positional : 0;
+  const absolutePathPenalty = (sel) => isAbsolutePathLike(sel) ? selectorWeights.penalty_absolute_path : 0;
+  const digitsRatioPenalty = (sel) => {
+    const ratio = digitsRatioInTokens(sel); // 0..1
+    return Math.round(ratio * Math.abs(selectorWeights.penalty_digits_ratio_max)) * -1;
+  };
+  const depthPenalty = (sel) => {
+    const depth = pathDepth(sel);
+    const extra = Math.max(0, depth - 2);
+    return extra * selectorWeights.penalty_per_depth_after2;
+  };
+  const complexityPenalty = (sel) => complexityScore(sel) * selectorWeights.penalty_per_extra_complex;
+  const elementRefsPenalty = (sel) => {
+    const refs = elementRefCount(sel);
+    const extra = Math.max(0, refs - 1);
+    return extra * selectorWeights.penalty_per_element_ref_after1;
+  };
+
+  function computeSelectorScore(item, targetEl){
+    const sel = item.isCypress ? item.sel : item.sel; // одинаково, item.sel всегда строка
+    let score = 0;
+    // Бонусы якорей
+    score += anchorTypeBonuses(sel, targetEl);
+    // Штрафы/бонусы
+    score += positionalPenalty(sel);
+    score += absolutePathPenalty(sel);
+    score += digitsRatioPenalty(sel);
+    score += depthPenalty(sel);
+    score += complexityPenalty(sel);
+    score += elementRefsPenalty(sel);
+    score += textRiskPenalty(sel);
+    score += containerQualityBonus(sel);
+    score += visibilityContextBonus(sel);
+    score += actionFitScore(sel, targetEl);
+    score += fallbackResilienceBonus(sel);
+    // Штраф за комбинатор '+' (зависимость от соседей)
+    if (/\+/.test(sel)) score += selectorWeights.penalty_combinator_plus;
+    return score;
+  }
+
+  // ==== Быстродействие: общий тайм-бюджет и кэш запросов ====
+  let __buildBudgetEnd = 0; // timestamp (performance.now) когда прекращаем дорогие операции
+  const __queryCache = new Map(); // selector -> Array<Element>
+  const budgetExpired = () => __buildBudgetEnd > 0 && performance.now() > __buildBudgetEnd;
+  const resetPerfGuards = () => { __buildBudgetEnd = 0; __queryCache.clear(); };
+
   const isUnique = (selector, el) => {
-    try { const n = document.querySelectorAll(selector); return n.length === 1 && n[0] === el; } catch { return false; }
+    try {
+      let list = __queryCache.get(selector);
+      if (!list) {
+        // Кэшируем результаты querySelectorAll для повтора в рамках одной генерации
+        list = Array.from(document.querySelectorAll(selector));
+        __queryCache.set(selector, list);
+      }
+      return list.length === 1 && list[0] === el;
+    } catch { return false; }
   };
   
   // Функция для обнаружения похожих атрибутов
@@ -174,6 +411,97 @@
     
     return similarAttrs;
   };
+
+  // Находит ближайший стабильный предок и его уникальный селектор без цифр
+  function findStableScope(el) {
+    let current = el.parentElement;
+    let depth = 0;
+    while (current && depth < 10) {
+      // 1) Предок с ID без цифр
+      if (current.id && !hasDigits(current.id)) {
+        const sel = `#${esc(current.id)}`;
+        if (document.querySelectorAll(sel).length === 1) {
+          return { scopeEl: current, scopeSelector: sel };
+        }
+      }
+
+      // 2) Предпочтительные data-атрибуты без цифр
+      for (const a of prefDataAttrs) {
+        const v = current.getAttribute && current.getAttribute(a);
+        if (!v || hasDigits(v)) continue;
+        const sel = `[${a}="${esc(v)}"]`;
+        if (document.querySelectorAll(sel).length === 1) {
+          return { scopeEl: current, scopeSelector: sel };
+        }
+      }
+
+      // 3) Уникальные стабильные классы без цифр
+      if (current.classList && current.classList.length > 0) {
+        const stable = [...current.classList].filter(c => c && !looksDynamic(c) && !hasDigits(c) && !c.startsWith('__dompick'));
+        for (const cls of stable.slice(0, 2)) {
+          const sel = `.${esc(cls)}`;
+          if (document.querySelectorAll(sel).length === 1) {
+            return { scopeEl: current, scopeSelector: sel };
+          }
+        }
+      }
+
+      current = current.parentElement;
+      depth++;
+    }
+    return null;
+  }
+
+  // Строит кратчайший позиционный путь от предка до элемента вида tag(>tag:nth-of-type(k))
+  function buildMinimalPathFromAncestor(el, ancestorEl) {
+    const parts = [];
+    let current = el;
+    while (current && current !== ancestorEl) {
+      const parent = current.parentElement;
+      if (!parent) break;
+      const tag = current.tagName.toLowerCase();
+      const sameTagSiblings = [...parent.children].filter(c => c.tagName.toLowerCase() === tag);
+      const index = sameTagSiblings.indexOf(current);
+      const part = sameTagSiblings.length === 1 || index < 0 ? tag : `${tag}:nth-of-type(${index + 1})`;
+      parts.unshift(part);
+      current = parent;
+    }
+    return parts.join(' > ');
+  }
+
+  // Генерирует селекторы: стабильный предок (без цифр) + минимальный позиционный путь до элемента
+  function byStableScopePath(el) {
+    const out = [];
+    const found = findStableScope(el);
+    if (!found) return out;
+    const { scopeEl, scopeSelector } = found;
+    const path = buildMinimalPathFromAncestor(el, scopeEl);
+    if (!path) return out;
+
+    const directSel = `${scopeSelector} > ${path}`;
+    if (isUnique(directSel, el)) out.push({ sel: directSel, score: 92 });
+
+    const descSel = `${scopeSelector} ${path}`;
+    if (isUnique(descSel, el)) out.push({ sel: descSel, score: 90 });
+
+    // Попробуем упростить путь, заменив хвост на стабильный класс/тег,
+    // например: '#student-next-lesson span.empty'
+    const targetClassList = el.classList ? [...el.classList] : [];
+    const stableClass = targetClassList.find(c => c && !looksDynamic(c) && !hasDigits(c) && !c.startsWith('__dompick'));
+    if (stableClass) {
+      const shortSel1 = `${scopeSelector} .${esc(stableClass)}`;
+      if (isUnique(shortSel1, el)) out.push({ sel: shortSel1, score: 94 });
+      const tag = el.tagName.toLowerCase();
+      const shortSel2 = `${scopeSelector} ${tag}.${esc(stableClass)}`;
+      if (isUnique(shortSel2, el)) out.push({ sel: shortSel2, score: 95 });
+    }
+    // Вариант по тегу, если класс не подходит
+    const tag = el.tagName.toLowerCase();
+    const tagSel = `${scopeSelector} ${tag}`;
+    if (isUnique(tagSel, el)) out.push({ sel: tagSel, score: 88 });
+
+    return out;
+  }
 
   // Функция для извлечения текста из элемента
   const getElementText = (el) => {
@@ -260,22 +588,23 @@
   // Проверка уникальности элемента по тексту
   const isUniqueByText = (el, text, tagFilter = null) => {
     try {
-      const elements = tagFilter 
-        ? document.querySelectorAll(tagFilter)
-        : document.querySelectorAll('*');
-      
+      if (budgetExpired()) return false; // избегаем дорогих глобальных проходов при исчерпании бюджета
+      const cachedSel = tagFilter || '*';
+      let candidates = __queryCache.get(`__text_${cachedSel}`);
+      if (!candidates) {
+        candidates = Array.from(document.querySelectorAll(cachedSel));
+        __queryCache.set(`__text_${cachedSel}`, candidates);
+      }
       let matches = 0;
       let foundElement = null;
-      
-      for (const element of elements) {
+      for (const element of candidates) {
         const elementText = getElementText(element);
         if (elementText === text) {
           matches++;
           foundElement = element;
-          if (matches > 1) break;
+          if (matches > 1 || budgetExpired()) break;
         }
       }
-      
       return matches === 1 && foundElement === el;
     } catch {
       return false;
@@ -285,23 +614,20 @@
   // Проверка уникальности элемента по тексту внутри родителя
   const isUniqueByTextInParent = (el, text, parent) => {
     try {
+      if (!parent || budgetExpired()) return false;
       const elements = parent.querySelectorAll('*');
       let matches = 0;
       let foundElement = null;
-      
       for (const element of elements) {
         const elementText = getElementText(element);
         if (elementText === text) {
           matches++;
           foundElement = element;
-          if (matches > 1) break;
+          if (matches > 1 || budgetExpired()) break;
         }
       }
-      
       return matches === 1 && foundElement === el;
-    } catch {
-      return false;
-    }
+    } catch { return false; }
   };
 
   // Поиск минимального уникального контекста для cy.contains()
@@ -618,6 +944,14 @@
   // Поднимаемся к «осмысленной» цели
   function snapTarget(el){
     const originalEl = el; // Сохраняем исходный элемент
+    // Если исходный элемент несёт осмысленный текст — считаем его целевым,
+    // чтобы не подниматься до родителя с цифровым ID
+    try {
+      const origText = getElementText(originalEl);
+      if (isGoodTextForContains(origText)) {
+        return originalEl;
+      }
+    } catch {}
     let cur = el, depth = 0;
     
     while (cur && depth < 6){
@@ -636,10 +970,57 @@
   }
 
   // ==== Стратегии генерации (как в предыдущей версии) ====
-  function byId(el){ return el.id && isUnique(`#${esc(el.id)}`, el) ? [{sel: `#${esc(el.id)}`, score: 100}] : []; }
-  function byPreferredData(el){ const out=[]; for(const a of prefDataAttrs){ const v=el.getAttribute&&el.getAttribute(a); if(!v) continue; const s=`[${a}="${esc(v)}"]`; if(isUnique(s,el)) out.push({sel:s,score:95}); const s2=`${el.tagName.toLowerCase()}${s}`; if(isUnique(s2,el)) out.push({sel:s2,score:93}); } return out; }
-  function byAnyData(el){ const out=[]; if(!el.attributes) return out; for(const {name,value} of el.attributes){ if(!name.startsWith('data-')||!value) continue; const s=`[${name}="${esc(value)}"]`; if(isUnique(s,el)) out.push({sel:s,score:85}); const s2=`${el.tagName.toLowerCase()}${s}`; if(isUnique(s2,el)) out.push({sel:s2,score:83}); } return out; }
-  function byAttr(el){ const out=[]; for(const a of okAttrs){ const v=el.getAttribute&&el.getAttribute(a); if(!v) continue; const s=`[${a}="${esc(v)}"]`; if(isUnique(s,el)) out.push({sel:s,score:80}); const s2=`${el.tagName.toLowerCase()}${s}`; if(isUnique(s2,el)) out.push({sel:s2,score:78}); } const role=el.getAttribute&&el.getAttribute('role'); const al=el.getAttribute&&el.getAttribute('aria-label'); if(role&&al){ const s=`[role="${esc(role)}"][aria-label="${esc(al)}"]`; if(isUnique(s,el)) out.push({sel:s,score:82}); } return out; }
+  function byId(el){
+    if (!el.id) return [];
+    const id = el.id;
+    const sel = `#${esc(id)}`;
+    if (!isUnique(sel, el)) return [];
+    // Если ID содержит цифры — исключаем из базовых: вернётся позже через uniqueWithinScope/агрессивные
+    if (hasDigits(id)) return [];
+    return [{ sel, score: 100 }];
+  }
+  function byPreferredData(el){
+    const out=[];
+    for(const a of prefDataAttrs){
+      const v=el.getAttribute&&el.getAttribute(a);
+      if(!v) continue;
+      const s=`[${a}="${esc(v)}"]`;
+      if(isUnique(s,el)) out.push({sel:s,score: hasDigits(v) ? 0 : 95});
+      const s2=`${el.tagName.toLowerCase()}${s}`;
+      if(isUnique(s2,el)) out.push({sel:s2,score: hasDigits(v) ? 0 : 93});
+    }
+    return out;
+  }
+  function byAnyData(el){
+    const out=[];
+    if(!el.attributes) return out;
+    for(const {name,value} of el.attributes){
+      if(!name.startsWith('data-')||!value) continue;
+      const s=`[${name}="${esc(value)}"]`;
+      if(isUnique(s,el)) out.push({sel:s,score: hasDigits(value) ? 0 : 85});
+      const s2=`${el.tagName.toLowerCase()}${s}`;
+      if(isUnique(s2,el)) out.push({sel:s2,score: hasDigits(value) ? 0 : 83});
+    }
+    return out;
+  }
+  function byAttr(el){
+    const out=[];
+    for(const a of okAttrs){
+      const v=el.getAttribute&&el.getAttribute(a);
+      if(!v) continue;
+      const s=`[${a}="${esc(v)}"]`;
+      if(isUnique(s,el)) out.push({sel:s,score: hasDigits(v) ? 0 : 80});
+      const s2=`${el.tagName.toLowerCase()}${s}`;
+      if(isUnique(s2,el)) out.push({sel:s2,score: hasDigits(v) ? 0 : 78});
+    }
+    const role=el.getAttribute&&el.getAttribute('role');
+    const al=el.getAttribute&&el.getAttribute('aria-label');
+    if(role&&al){
+      const s=`[role="${esc(role)}"][aria-label="${esc(al)}"]`;
+      if(isUnique(s,el)) out.push({sel:s,score: hasDigits(role)||hasDigits(al) ? 0 : 82});
+    }
+    return out;
+  }
   function byClassCombos(el){ 
     const out=[]; 
     const classes=el.classList ? [...el.classList].filter(c => 
@@ -650,17 +1031,17 @@
     
     for(const c of classes){ 
       const s=`.${esc(c)}`; 
-      if(isUnique(s,el)) out.push({sel:s,score:70}); 
+      if(isUnique(s,el)) out.push({sel:s,score: hasDigits(c) ? 0 : 70}); 
       const s2=`${el.tagName.toLowerCase()}${s}`; 
-      if(isUnique(s2,el)) out.push({sel:s2,score:72}); 
+      if(isUnique(s2,el)) out.push({sel:s2,score: hasDigits(c) ? 0 : 72}); 
     } 
     
     if(classes.length>=2){ 
       const [a,b]=classes; 
       const s=`.${esc(a)}.${esc(b)}`; 
-      if(isUnique(s,el)) out.push({sel:s,score:73}); 
+      if(isUnique(s,el)) out.push({sel:s,score: (hasDigits(a)||hasDigits(b)) ? 0 : 73}); 
       const s2=`${el.tagName.toLowerCase()}${s}`; 
-      if(isUnique(s2,el)) out.push({sel:s2,score:74}); 
+      if(isUnique(s2,el)) out.push({sel:s2,score: (hasDigits(a)||hasDigits(b)) ? 0 : 74}); 
     } 
     
     return out; 
@@ -692,7 +1073,7 @@
       }
       
       // Для элементов в специальных контейнерах - ОБЯЗАТЕЛЬНО используем контекст
-      const specialContainer = el.closest('.datepicker, .modal, .dropdown, .popup, .overlay, .sidebar, .panel');
+      const specialContainer = el.closest('.datepicker, .modal, .modal-body, .modal-content, .modal-dialog, .dropdown, .popup, .overlay, .sidebar, .panel');
       if (specialContainer) {
         const containerClass = specialContainer.classList[0];
         if (containerClass && isUniqueByTextInParent(el, text, specialContainer)) {
@@ -814,7 +1195,7 @@
     let p = el.parentElement, depth = 0;
     
     while (p && depth < 5) {
-      if (p.id) {
+      if (p.id && !hasDigits(p.id)) {
         const idSel = `#${esc(p.id)}`;
         if (document.querySelectorAll(idSel).length === 1) {
           scopes.push(idSel);
@@ -826,6 +1207,7 @@
         if (v) {
           const ds = `[${a}="${esc(v)}"]`;
           if (document.querySelectorAll(ds).length === 1) {
+            // Контексты с цифрами оставляем, но понизим их оценку позже
             scopes.push(ds);
           }
         }
@@ -899,28 +1281,28 @@
     
     for (const scope of scopes) {
       for (const atom of attributeAtoms) {
-        // Тестируем атом как есть
+        // Тестируем атом как есть (избегаем цифровых контекстов)
         const selector1 = `${scope} ${atom}`;
         if (isUnique(selector1, el)) {
-          out.push({sel: selector1, score: 90});
+          out.push({sel: selector1, score: /\d/.test(scope) || /\d/.test(atom) ? 80 : 90});
         }
         
         // Тестируем с прямым потомком
         const selector2 = `${scope} > ${atom}`;
         if (isUnique(selector2, el)) {
-          out.push({sel: selector2, score: 92});
+          out.push({sel: selector2, score: /\d/.test(scope) || /\d/.test(atom) ? 82 : 92});
         }
         
         // Тестируем с тегом + атом
         const selector3 = `${scope} ${tag}${atom}`;
         if (isUnique(selector3, el)) {
-          out.push({sel: selector3, score: 88});
+          out.push({sel: selector3, score: /\d/.test(scope) || /\d/.test(atom) ? 78 : 88});
         }
         
         // Тестируем с тегом + атом как прямой потомок
         const selector4 = `${scope} > ${tag}${atom}`;
         if (isUnique(selector4, el)) {
-          out.push({sel: selector4, score: 89});
+          out.push({sel: selector4, score: /\d/.test(scope) || /\d/.test(atom) ? 79 : 89});
         }
       }
       
@@ -928,19 +1310,36 @@
       if (attributeAtoms.length === 0) {
         const selector5 = `${scope} ${tag}`;
         if (isUnique(selector5, el)) {
-          out.push({sel: selector5, score: 85});
+          out.push({sel: selector5, score: /\d/.test(scope) ? 75 : 85});
         }
         
         const selector6 = `${scope} > ${tag}`;
         if (isUnique(selector6, el)) {
-          out.push({sel: selector6, score: 87});
+          out.push({sel: selector6, score: /\d/.test(scope) ? 77 : 87});
         }
       }
     }
     
     return out;
   }
-  function nthPath(el){ const parts=[]; let cur=el; while(cur&&cur.nodeType===1&&parts.length<8){ if(cur.id){ parts.unshift(`#${esc(cur.id)}`); break; } const tag=cur.tagName.toLowerCase(); const p=cur.parentElement; if(p){ parts.unshift(tag); } else parts.unshift(tag); cur=p; } const sel=parts.join(' > '); return isUnique(sel,el)?[{sel,score:60}]:[]; }
+  function nthPath(el){
+    const parts=[];
+    let cur=el;
+    let usedStableId = false;
+    while(cur && cur.nodeType===1 && parts.length<8){
+      if(cur.id && !hasDigits(cur.id)){
+        parts.unshift(`#${esc(cur.id)}`);
+        usedStableId = true;
+        break;
+      }
+      const tag=cur.tagName.toLowerCase();
+      const p=cur.parentElement;
+      parts.unshift(tag);
+      cur=p;
+    }
+    const sel=parts.join(' > ');
+    return isUnique(sel,el)?[{sel,score: usedStableId ? 62 : 58}]:[];
+  }
   
   // Структурные селекторы с nth-child
   function byNthChild(el) {
@@ -1179,64 +1578,66 @@
   // Собираем все возможные селекторы
   function collectAllSelectors(el) {
     const allSelectors = [];
-    
-    // Основные стратегии
-    const basicStrategies = [
-      ...byId(el),
-      ...byPreferredData(el),
-      ...byAnyData(el),
-      ...byAttr(el),
-      ...byClassCombos(el),
-      ...bySimilarAttrs(el),
-      ...uniqueWithinScope(el),
-      ...nthPath(el)
-    ];
-    
-    // Cypress текстовые селекторы
-    const cypressStrategies = [
-      ...byCypressText(el),
-      ...byCypressCombo(el)
-    ];
-    
-    // Структурные селекторы с nth-child
-    const nthStrategies = [
-      ...byNthChild(el),
-      ...byParentWithNth(el),
-      ...bySiblingSelectors(el),
-      ...byCalendarSelectors(el)
-    ];
-    
-    // Агрессивные стратегии
-    let aggressiveStrategies = [];
-    const basicCount = basicStrategies.length + cypressStrategies.length + nthStrategies.length;
-    
-    if (basicCount < 15) {
-      aggressiveStrategies = [
-        ...generateAggressiveFallbacks(el),
-        ...generateSuperAggressiveFallbacks(el)
-      ];
-    }
-    
-    // Валидируем и добавляем все селекторы
     const candidatesMap = new Map();
-    
-    for (const strategies of [basicStrategies, cypressStrategies, nthStrategies, aggressiveStrategies]) {
-      for (const item of strategies) {
+
+    // Добавляем селекторы порциями, проверяя бюджет
+    const addBatch = (batch) => {
+      for (const item of batch) {
+        if (budgetExpired()) break;
         if (!candidatesMap.has(item.sel)) {
-          // Валидация для Cypress селекторов
           if (item.isCypress) {
             if (validateCypressSelector(item.sel, el)) {
+              item.__targetEl = el;
               candidatesMap.set(item.sel, item);
               allSelectors.push(item);
             }
           } else {
+            item.__targetEl = el;
             candidatesMap.set(item.sel, item);
             allSelectors.push(item);
           }
         }
       }
+    };
+
+    // 1) Самые быстрые стратегии
+    // Сначала стратегии без цифр (score уже понижен внутри)
+    addBatch(byStableScopePath(el));
+    addBatch(byClassCombos(el));
+    addBatch(byAttr(el));
+    addBatch(byPreferredData(el));
+    addBatch(byId(el));
+
+    // 2) Остальные базовые
+    addBatch(byAnyData(el));
+    addBatch(uniqueWithinScope(el));
+    addBatch(nthPath(el));
+
+    // 3) Текстовые (дорогие) — после базовых
+    if (!budgetExpired()) addBatch(byCypressText(el));
+    if (!budgetExpired()) addBatch(byCypressCombo(el));
+    // Явный короткий текстовый селектор внутри стабильного scope
+    const scope = findStableScope(el);
+    if (scope) {
+      const texts = getAllTexts(el).filter(t => isGoodTextForContains(t));
+      const shortText = texts.find(t => t.length <= 25);
+      if (shortText) {
+        const escaped = shortText.replace(/'/g, "\\'");
+        const sel1 = `cy.get('${scope.scopeSelector}').contains('${escaped}')`;
+        addBatch([{ sel: sel1, score: 96, isCypress: true }]);
+      }
     }
-    
+
+    // 4) Позиционные
+    if (!budgetExpired()) addBatch(byNthChild(el));
+    if (!budgetExpired()) addBatch(byParentWithNth(el));
+    if (!budgetExpired()) addBatch(bySiblingSelectors(el));
+    if (!budgetExpired()) addBatch(byCalendarSelectors(el));
+
+    // 5) Агрессивные — включаем всегда (с приоритетом ниже)
+    if (!budgetExpired()) addBatch(generateAggressiveFallbacks(el));
+    if (!budgetExpired()) addBatch(generateSuperAggressiveFallbacks(el));
+
     return allSelectors;
   }
 
@@ -1274,17 +1675,19 @@
       }
     }
     
-    // Сортируем каждую группу по качеству
+    // Динамическая сортировка по новому рейтингу
     const sortByQuality = (a, b) => {
-      const scoreDiff = b.score - a.score;
-      if (Math.abs(scoreDiff) > 5) return scoreDiff;
+      const aScore = computeSelectorScore(a, a.__targetEl || null);
+      const bScore = computeSelectorScore(b, b.__targetEl || null);
+      if (aScore !== bScore) return bScore - aScore;
+      // При равенстве — более короткий лучше
       return a.sel.length - b.sel.length;
     };
     
     groups.basic.sort(sortByQuality);
     groups.contains.sort(sortByQuality);
     groups.nth.sort(sortByQuality);
-    groups.aggressive.sort(sortByQuality);
+    // Агрессивные можно оставить без сложной сортировки
     
     return groups;
   }
@@ -1372,7 +1775,88 @@
       out.push({sel: tag, score: 25});
     }
     
+    // 7. Минимальный уникальный позиционный селектор (короткий суффикс абсолютного пути)
+    const minimalPositional = buildMinimalPositionalSelector(el);
+    if (minimalPositional) {
+      out.push({ sel: minimalPositional, score: 8 });
+    }
+    
+    // 8. Абсолютный CSS-путь (как самый низкоприоритетный запасной вариант)
+    out.push({ sel: buildAbsoluteCssPath(el), score: 5 });
+    
     return out;
+  }
+
+  // Абсолютный CSS-путь к элементу: html > body > ... > tag:nth-of-type(n)
+  function buildAbsoluteCssPath(el) {
+    try {
+      const parts = [];
+      let current = el;
+      const stopAt = document.documentElement; // html
+      while (current && current !== stopAt) {
+        const parent = current.parentElement;
+        if (!parent) break;
+        const tag = current.tagName.toLowerCase();
+        const sameTagSiblings = [...parent.children].filter(c => c.tagName.toLowerCase() === tag);
+        const index = sameTagSiblings.indexOf(current);
+        // Если среди детей родителя этот tag встречается один раз, nth-of-type не нужен
+        const part = sameTagSiblings.length === 1 || index < 0 ? tag : `${tag}:nth-of-type(${index + 1})`;
+        parts.unshift(part);
+        current = parent;
+      }
+      return parts.length ? parts.join(' > ') : el.tagName.toLowerCase();
+    } catch {
+      return el.tagName ? el.tagName.toLowerCase() : '*';
+    }
+  }
+
+  // Строит массив сегментов абсолютного пути от корня к элементу
+  function buildAbsoluteCssSegments(el) {
+    const segments = [];
+    let current = el;
+    const stopAt = document.documentElement; // html
+    while (current && current !== stopAt) {
+      const parent = current.parentElement;
+      if (!parent) break;
+      const tag = current.tagName.toLowerCase();
+      const sameTagSiblings = [...parent.children].filter(c => c.tagName.toLowerCase() === tag);
+      const index = sameTagSiblings.indexOf(current);
+      const needsNth = !(sameTagSiblings.length === 1 || index < 0);
+      segments.unshift({ tag, index: index + 1, needsNth });
+      current = parent;
+    }
+    return segments;
+  }
+
+  // Возвращает самый короткий уникальный позиционный селектор (суффикс абсолютного пути)
+  function buildMinimalPositionalSelector(el) {
+    try {
+      const segments = buildAbsoluteCssSegments(el);
+      if (segments.length === 0) return el.tagName.toLowerCase();
+      // Функция преобразования сегментов в селекторную строку
+      const joinFrom = (startIdx) => segments
+        .slice(startIdx)
+        .map(seg => seg.needsNth ? `${seg.tag}:nth-of-type(${seg.index})` : seg.tag)
+        .join(' > ');
+      
+      // Проверяем суффиксы от самого короткого (лист) к более длинным
+      for (let i = segments.length - 1; i >= 0; i--) {
+        const candidate = joinFrom(i);
+        if (isUnique(candidate, el)) return candidate;
+        // Попробуем локально упростить листовой сегмент, если возможно
+        if (i === segments.length - 1) {
+          const leaf = segments[segments.length - 1];
+          if (leaf.needsNth) {
+            const withoutNth = joinFrom(i).replace(/:nth-of-type\(\d+\)$/,'');
+            if (isUnique(withoutNth, el)) return withoutNth;
+          }
+        }
+      }
+      // Если ни один суффикс не уникален — возвращаем полный путь
+      return joinFrom(0);
+    } catch {
+      return buildAbsoluteCssPath(el);
+    }
   }
 
   // Генерация селекторов с уникальными родителями + nth-child
@@ -1948,9 +2432,7 @@
   // ==== UI ====
   function showToast(msg){ let t=document.querySelector('.__dompick-toast'); if(!t){ t=document.createElement('div'); t.className='__dompick-toast'; document.body.appendChild(t); } t.textContent=msg; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),1400); }
   function openModalFor(el) {
-    const groups = buildCandidates(el);
-    const availableActions = getAvailableActions(el);
-    
+    // Открываем модалку СРАЗУ, а тяжёлую генерацию переносим на idle/next-tick
     const modal = document.createElement('div');
     modal.className = '__dompick-modal';
     modal.innerHTML = `
@@ -1961,19 +2443,15 @@
           <button class="__dompick-copy" data-close>✖</button>
         </div>
         <div class="__dompick-body">
-          <div class="__dompick-groups"></div>
+          <div class="__dompick-groups">
+            <div id="__dompick-loading" style="opacity:.8;font-size:12px">Генерация селекторов...</div>
+          </div>
         </div>
       </div>
     `;
     document.body.appendChild(modal);
-    
+
     const groupsContainer = modal.querySelector('.__dompick-groups');
-    
-    // Создаем группы селекторов
-    createSelectorGroup(groupsContainer, 'Базовые селекторы', groups.basicSelectors, groups.moreBasic, availableActions, 'basic');
-    createSelectorGroup(groupsContainer, 'Селекторы с .contains', groups.containsSelectors, groups.moreContains, availableActions, 'contains');
-    createSelectorGroup(groupsContainer, 'Позиционные селекторы', groups.nthSelectors, groups.moreNth, availableActions, 'nth');
-    
     const closeModal = () => {
       if (fixedHighlighted) {
         removeHighlight(fixedHighlighted);
@@ -1981,12 +2459,45 @@
       }
       modal.remove();
     };
-    
     modal.querySelector('[data-close]').addEventListener('click', closeModal);
     modal.querySelector('.__dompick-backdrop').addEventListener('click', closeModal);
-    modal.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') closeModal();
-    });
+    modal.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal(); });
+
+    // Планируем асинхронную генерацию с тайм-бюджетом
+    const runAsync = () => {
+      // Устанавливаем увеличенный бюджет на генерацию и чистим кэш
+      resetPerfGuards();
+      __buildBudgetEnd = performance.now() + 5000; // можно увеличить при необходимости
+      const groups = buildCandidates(el);
+      resetPerfGuards();
+
+      const availableActions = getAvailableActions(el);
+      const loading = groupsContainer.querySelector('#__dompick-loading');
+      if (loading) loading.remove();
+
+      createSelectorGroup(groupsContainer, 'Базовые селекторы', groups.basicSelectors, groups.moreBasic, availableActions, 'basic');
+      createSelectorGroup(groupsContainer, 'Селекторы с .contains', groups.containsSelectors, groups.moreContains, availableActions, 'contains');
+      createSelectorGroup(groupsContainer, 'Позиционные селекторы', groups.nthSelectors, groups.moreNth, availableActions, 'nth');
+
+      // Если есть агрессивные — тоже показываем
+      if (groups.aggressive && groups.aggressive.length > 0) {
+        createSelectorGroup(groupsContainer, 'Агрессивные селекторы', groups.aggressive.slice(0, 5), groups.aggressive.slice(5), availableActions, 'aggressive');
+      }
+
+      // ГАРАНТИЯ: если ни одного селектора не сгенерировалось — формируем абсолютный CSS‑путь
+      const totalCount = groups.basicSelectors.length + groups.containsSelectors.length + groups.nthSelectors.length + (groups.aggressive?.length || 0);
+      if (totalCount === 0) {
+        const absPath = buildAbsoluteCssPath(el);
+        const fallback = [{ sel: absPath, score: 1 }];
+        createSelectorGroup(groupsContainer, 'Агрессивные селекторы (fallback)', fallback, [], availableActions, 'aggressive');
+      }
+    };
+
+    if ('requestIdleCallback' in window) {
+      window.requestIdleCallback(runAsync, { timeout: 250 });
+    } else {
+      setTimeout(runAsync, 0);
+    }
   }
 
   // Создание группы селекторов
@@ -2056,7 +2567,7 @@
     const selectorRow = document.createElement('div');
     selectorRow.className = '__dompick-selector-row';
     selectorRow.style.display = 'grid';
-    selectorRow.style.gridTemplateColumns = '1fr auto';
+    selectorRow.style.gridTemplateColumns = '1fr auto auto';
     selectorRow.style.gap = '12px';
     selectorRow.style.alignItems = 'center';
     selectorRow.style.marginBottom = '8px';
@@ -2070,6 +2581,24 @@
     selectorPart.style.marginBottom = '0';
     selectorPart.innerHTML = `<div><b>${number}.</b> <code style="font-size: 11px;">${displayText.replace(/</g,'&lt;')}</code></div>`;
     
+    // Бейдж рейтинга (0..100), цвет от красного к зелёному
+    const rawScore = (typeof computeSelectorScore === 'function') ? computeSelectorScore(selector, selector.__targetEl || null) : 0;
+    const normalized = Math.max(0, Math.min(100, Math.round(50 + 50 * Math.tanh(rawScore / 80)))) ;
+    const hue = Math.round((normalized / 100) * 120); // 0 (red) -> 120 (green)
+    const ratingBadge = document.createElement('div');
+    ratingBadge.className = '__dompick-rating';
+    ratingBadge.textContent = String(normalized);
+    ratingBadge.title = `Рейтинг селектора: ${normalized} (raw: ${rawScore})`;
+    ratingBadge.style.minWidth = '36px';
+    ratingBadge.style.textAlign = 'center';
+    ratingBadge.style.fontSize = '10px';
+    ratingBadge.style.fontWeight = 'bold';
+    ratingBadge.style.color = '#fff';
+    ratingBadge.style.padding = '2px 6px';
+    ratingBadge.style.borderRadius = '6px';
+    ratingBadge.style.background = `linear-gradient(90deg, hsl(${hue}, 70%, 45%), hsl(${hue}, 70%, 38%))`;
+    ratingBadge.style.boxShadow = '0 0 0 1px rgba(0,0,0,.05) inset';
+
     // Правая часть - кнопки
     const buttonsContainer = document.createElement('div');
     buttonsContainer.className = '__dompick-buttons';
@@ -2103,6 +2632,7 @@
     });
     
     selectorRow.appendChild(selectorPart);
+    selectorRow.appendChild(ratingBadge);
     selectorRow.appendChild(buttonsContainer);
     container.appendChild(selectorRow);
   }
