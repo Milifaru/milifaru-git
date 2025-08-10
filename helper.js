@@ -174,6 +174,10 @@
     penalty_per_element_ref_after1: -2,
     // Использование :nth-* (доп. к positional)
     penalty_uses_nth: -15,
+    // Общий штраф за каждый атрибут в селекторе (квадратные скобки)
+    penalty_per_attr_token: -6,
+    // Доп. штраф за data-* атрибуты (кроме тестовых data-testid/qa/cy)
+    penalty_per_data_attr_non_test: -4,
     // Риск текста (low 0, mid -6, high -15)
     penalty_text_mid: -6,
     penalty_text_high: -15,
@@ -202,6 +206,9 @@
     penalty_attr_clickable: -4,
     // Штраф за комбинатор "+" (хрупкая связь с соседом)
     penalty_combinator_plus: -4,
+    // Бонусы для простых уникальных селекторов на классы
+    bonus_simple_unique_class: 14,       // .class
+    bonus_simple_tag_class: 12,          // tag.class
   };
 
   // --- Утилиты анализа селектора ---
@@ -247,11 +254,30 @@
     const total = attrCount + pseudoCount;
     return Math.max(0, total - 2); // сверх первых двух
   };
+  const attributeTokenPenalty = (s) => {
+    const attrTokens = (s.match(/\[[^\]]+\]/g) || []);
+    let penalty = 0;
+    for (const tok of attrTokens) {
+      penalty += selectorWeights.penalty_per_attr_token; // общий штраф за []
+      // data-* атрибуты
+      const isTest = /\[(data-testid|data-qa|data-cy|data-test|data-test-id|data-automation-id)=/.test(tok);
+      const isData = /\[data-[-a-zA-Z0-9_]+=/.test(tok);
+      if (isData && !isTest) penalty += selectorWeights.penalty_per_data_attr_non_test;
+    }
+    return penalty;
+  };
   const usesNth = (s) => /:nth-(?:child|of-type)\(\d+\)/.test(s) || /\.eq\(\d+\)/.test(s);
   const isAbsolutePathLike = (s) => {
     // Только теги, опционально :nth-of-type, с '>'/пробелами, без # . [ ]
     if (/[#\.\[]/.test(s)) return false;
     return /^\s*[a-z][a-z0-9-]*(?::nth-of-type\(\d+\))?(\s*>\s*[a-z][a-z0-9-]*(?::nth-of-type\(\d+\))?)*(\s*)$/.test(s);
+  };
+  const isAggressiveSelector = (s) => {
+    if (isAbsolutePathLike(s)) return true;
+    if (usesNth(s)) return true;
+    if (pathDepth(s) > 6) return true;
+    if (/\+|~/.test(s)) return true;
+    return false;
   };
   const anchorTypeBonuses = (sel, targetEl) => {
     let bonus = 0;
@@ -350,6 +376,7 @@
     score += digitsRatioPenalty(sel);
     score += depthPenalty(sel);
     score += complexityPenalty(sel);
+    score += attributeTokenPenalty(sel);
     score += elementRefsPenalty(sel);
     score += textRiskPenalty(sel);
     score += containerQualityBonus(sel);
@@ -358,6 +385,14 @@
     score += fallbackResilienceBonus(sel);
     // Штраф за комбинатор '+' (зависимость от соседей)
     if (/\+/.test(sel)) score += selectorWeights.penalty_combinator_plus;
+
+    // Преференс простым уникальным классам и tag.class
+    try {
+      const onlyClass = /^\.[a-zA-Z_-][a-zA-Z0-9_-]*$/.test(sel) && !/\d/.test(sel);
+      if (onlyClass) score += selectorWeights.bonus_simple_unique_class;
+      const tagClass = /^[a-z][a-z0-9-]*\.[a-zA-Z_-][a-zA-Z0-9_-]*$/.test(sel) && !/\d/.test(sel);
+      if (tagClass) score += selectorWeights.bonus_simple_tag_class;
+    } catch {}
     return score;
   }
 
@@ -479,10 +514,10 @@
     if (!path) return out;
 
     const directSel = `${scopeSelector} > ${path}`;
-    if (isUnique(directSel, el)) out.push({ sel: directSel, score: 92 });
+    if (isUnique(directSel, el)) out.push({ sel: directSel });
 
     const descSel = `${scopeSelector} ${path}`;
-    if (isUnique(descSel, el)) out.push({ sel: descSel, score: 90 });
+    if (isUnique(descSel, el)) out.push({ sel: descSel });
 
     // Попробуем упростить путь, заменив хвост на стабильный класс/тег,
     // например: '#student-next-lesson span.empty'
@@ -490,15 +525,15 @@
     const stableClass = targetClassList.find(c => c && !looksDynamic(c) && !hasDigits(c) && !c.startsWith('__dompick'));
     if (stableClass) {
       const shortSel1 = `${scopeSelector} .${esc(stableClass)}`;
-      if (isUnique(shortSel1, el)) out.push({ sel: shortSel1, score: 94 });
+      if (isUnique(shortSel1, el)) out.push({ sel: shortSel1 });
       const tag = el.tagName.toLowerCase();
       const shortSel2 = `${scopeSelector} ${tag}.${esc(stableClass)}`;
-      if (isUnique(shortSel2, el)) out.push({ sel: shortSel2, score: 95 });
+      if (isUnique(shortSel2, el)) out.push({ sel: shortSel2 });
     }
     // Вариант по тегу, если класс не подходит
     const tag = el.tagName.toLowerCase();
     const tagSel = `${scopeSelector} ${tag}`;
-    if (isUnique(tagSel, el)) out.push({ sel: tagSel, score: 88 });
+    if (isUnique(tagSel, el)) out.push({ sel: tagSel });
 
     return out;
   }
@@ -977,7 +1012,7 @@
     if (!isUnique(sel, el)) return [];
     // Если ID содержит цифры — исключаем из базовых: вернётся позже через uniqueWithinScope/агрессивные
     if (hasDigits(id)) return [];
-    return [{ sel, score: 100 }];
+    return [{ sel }];
   }
   function byPreferredData(el){
     const out=[];
@@ -1046,7 +1081,7 @@
     
     return out; 
   }
-  function bySimilarAttrs(el){ const out=[]; const similarAttrs=findSimilarAttrs(el); for(const {name,value} of similarAttrs){ const s=`[${name}="${esc(value)}"]`; if(isUnique(s,el)) out.push({sel:s,score:75}); const s2=`${el.tagName.toLowerCase()}[${name}="${esc(value)}"]`; if(isUnique(s2,el)) out.push({sel:s2,score:77}); } return out; }
+  function bySimilarAttrs(el){ const out=[]; const similarAttrs=findSimilarAttrs(el); for(const {name,value} of similarAttrs){ const s=`[${name}="${esc(value)}"]`; if(isUnique(s,el)) out.push({sel:s}); const s2=`${el.tagName.toLowerCase()}[${name}="${esc(value)}"]`; if(isUnique(s2,el)) out.push({sel:s2}); } return out; }
   
   // Генерация Cypress команд по тексту
   function byCypressText(el) {
@@ -1063,13 +1098,13 @@
       // ВАЖНО: cy.contains('текст') используем только если текст ГЛОБАЛЬНО уникален
       if (isUniqueByText(el, text)) {
         const containsCmd = `cy.contains('${escapedText}')`;
-        out.push({sel: containsCmd, score: 85, isCypress: true});
+        out.push({sel: containsCmd, isCypress: true});
       }
       
       // cy.contains('tag', 'текст') - более специфичный, но тоже только если уникален
       if (isUniqueByText(el, text, tag)) {
         const containsWithTagCmd = `cy.contains('${tag}', '${escapedText}')`;
-        out.push({sel: containsWithTagCmd, score: 87, isCypress: true});
+        out.push({sel: containsWithTagCmd, isCypress: true});
       }
       
       // Для элементов в специальных контейнерах - ОБЯЗАТЕЛЬНО используем контекст
@@ -1078,7 +1113,7 @@
         const containerClass = specialContainer.classList[0];
         if (containerClass && isUniqueByTextInParent(el, text, specialContainer)) {
           const visibleContainsCmd = `cy.get('.${containerClass}').filter(':visible').contains('${escapedText}')`;
-          out.push({sel: visibleContainsCmd, score: 90, isCypress: true}); // Повышаем приоритет контекстных селекторов
+          out.push({sel: visibleContainsCmd, isCypress: true});
         }
       }
       
@@ -1088,7 +1123,7 @@
         const uniqueContext = findMinimalUniqueContext(el, text);
         if (uniqueContext) {
           const contextContainsCmd = `cy.get('${uniqueContext}').contains('${escapedText}')`;
-          out.push({sel: contextContainsCmd, score: 89, isCypress: true});
+          out.push({sel: contextContainsCmd, isCypress: true});
         }
       }
     }
@@ -1118,7 +1153,7 @@
           if (document.querySelectorAll(parentSel).length === 1) {
             if (isUniqueByTextInParent(el, text, p)) {
               const cmd = `cy.get('${parentSel}').contains('${escapedText}')`;
-              out.push({sel: cmd, score: 92, isCypress: true}); // Повышаем приоритет
+              out.push({sel: cmd, isCypress: true});
             }
           }
         }
@@ -1131,7 +1166,7 @@
             if (document.querySelectorAll(parentSel).length === 1) {
               if (isUniqueByTextInParent(el, text, p)) {
                 const cmd = `cy.get('${parentSel}').contains('${escapedText}')`;
-                out.push({sel: cmd, score: 93, isCypress: true}); // Высший приоритет для data-атрибутов
+                out.push({sel: cmd, isCypress: true});
               }
             }
           }
@@ -1152,7 +1187,7 @@
             if (document.querySelectorAll(parentSel).length === 1) {
               if (isUniqueByTextInParent(el, text, p)) {
                 const cmd = `cy.get('${parentSel}').contains('${escapedText}')`;
-                out.push({sel: cmd, score: 88, isCypress: true});
+                out.push({sel: cmd, isCypress: true});
               }
             }
           }
@@ -1163,7 +1198,7 @@
             if (document.querySelectorAll(parentSel).length === 1) {
               if (isUniqueByTextInParent(el, text, p)) {
                 const cmd = `cy.get('${parentSel}').contains('${escapedText}')`;
-                out.push({sel: cmd, score: 90, isCypress: true});
+                out.push({sel: cmd, isCypress: true});
               }
             }
           }
@@ -1177,7 +1212,7 @@
             const sameTagContainers = document.querySelectorAll(parentTag);
             if (sameTagContainers.length <= 2) { // Только если семантический тег почти уникален
               const cmd = `cy.get('${parentTag}').contains('${escapedText}')`;
-              out.push({sel: cmd, score: 85, isCypress: true});
+              out.push({sel: cmd, isCypress: true});
             }
           }
         }
@@ -1354,7 +1389,7 @@
     // nth-child по позиции среди всех детей
     const nthChildSel = `${tag}:nth-child(${index})`;
     if (isUnique(nthChildSel, el)) {
-      out.push({sel: nthChildSel, score: 45});
+      out.push({sel: nthChildSel});
     }
     
     // nth-of-type по позиции среди элементов того же типа
@@ -1363,7 +1398,7 @@
       const typeIndex = sameTypeSiblings.indexOf(el) + 1;
       const nthOfTypeSel = `${tag}:nth-of-type(${typeIndex})`;
       if (isUnique(nthOfTypeSel, el)) {
-        out.push({sel: nthOfTypeSel, score: 50});
+        out.push({sel: nthOfTypeSel});
       }
     }
     
@@ -1371,14 +1406,14 @@
     if (index === 1) {
       const firstChildSel = `${tag}:first-child`;
       if (isUnique(firstChildSel, el)) {
-        out.push({sel: firstChildSel, score: 55});
+        out.push({sel: firstChildSel});
       }
     }
     
     if (index === siblings.length) {
       const lastChildSel = `${tag}:last-child`;
       if (isUnique(lastChildSel, el)) {
-        out.push({sel: lastChildSel, score: 55});
+        out.push({sel: lastChildSel});
       }
     }
     
@@ -1405,7 +1440,7 @@
         const parentSel = `#${esc(currentParent.id)}`;
         const childSel = `${parentSel} > ${tag}:nth-child(${index})`;
         if (isUnique(childSel, el)) {
-          out.push({sel: childSel, score: 65});
+          out.push({sel: childSel});
         }
       }
       
@@ -1421,7 +1456,7 @@
           const parentSel = `.${classes.map(c => esc(c)).join('.')}`;
           const childSel = `${parentSel} > ${tag}:nth-child(${index})`;
           if (isUnique(childSel, el)) {
-            out.push({sel: childSel, score: 55});
+            out.push({sel: childSel});
           }
         }
       }
@@ -1450,7 +1485,7 @@
         const siblingId = `#${esc(prevSibling.id)}`;
         const adjacentSel = `${siblingId} + ${tag}`;
         if (isUnique(adjacentSel, el)) {
-          out.push({sel: adjacentSel, score: 58});
+          out.push({sel: adjacentSel});
         }
       }
       
@@ -1465,7 +1500,7 @@
           const siblingClass = `.${esc(classes[0])}`;
           const adjacentSel = `${siblingClass} + ${tag}`;
           if (isUnique(adjacentSel, el)) {
-            out.push({sel: adjacentSel, score: 48});
+            out.push({sel: adjacentSel});
           }
         }
       }
@@ -1519,12 +1554,12 @@
         }
         
         if (foundInDatepicker) {
-          out.push({sel: visibleCalendarSel, score: 65, isCypress: true});
+          out.push({sel: visibleCalendarSel, isCypress: true});
           
           // Поиск в datepicker-days только если такой элемент существует
           if (document.querySelector('.datepicker-days')) {
             const activeDaysSel = `cy.get('.datepicker-days:visible td').contains('${dayNumber}')`;
-            out.push({sel: activeDaysSel, score: 63, isCypress: true});
+            out.push({sel: activeDaysSel, isCypress: true});
           }
         }
       }
@@ -1542,7 +1577,7 @@
             const relativeSel = diff > 0 
               ? `cy.get('.datepicker').filter(':visible').find('td.today').nextAll('td').eq(${diff - 1})`
               : `cy.get('.datepicker').filter(':visible').find('td.today').prevAll('td').eq(${Math.abs(diff) - 1})`;
-            out.push({sel: relativeSel, score: 60, isCypress: true});
+            out.push({sel: relativeSel, isCypress: true});
           }
         }
       }
@@ -1624,7 +1659,7 @@
       if (shortText) {
         const escaped = shortText.replace(/'/g, "\\'");
         const sel1 = `cy.get('${scope.scopeSelector}').contains('${escaped}')`;
-        addBatch([{ sel: sel1, score: 96, isCypress: true }]);
+        addBatch([{ sel: sel1, isCypress: true }]);
       }
     }
 
@@ -1653,26 +1688,26 @@
     for (const selector of selectors) {
       const sel = selector.sel;
       
-      // Проверяем, содержит ли селектор .contains
+      // contains → contains
       if (sel.includes('cy.contains') || sel.includes('.contains(')) {
         groups.contains.push(selector);
+        continue;
       }
-      // Проверяем, содержит ли селектор nth-child или подобные
-      else if (sel.includes('nth-child') || sel.includes('nth-of-type') || 
-               sel.includes(':first-child') || sel.includes(':last-child') ||
-               sel.includes(':only-child') || sel.includes(':first-of-type') ||
-               sel.includes(':last-of-type') || sel.includes(':only-of-type') ||
-               sel.includes('nth(') || sel.includes('eq(')) {
+      // nth → nth
+      if (sel.includes('nth-child') || sel.includes('nth-of-type') || 
+          sel.includes(':first-child') || sel.includes(':last-child') ||
+          sel.includes(':only-child') || sel.includes(':first-of-type') ||
+          sel.includes(':last-of-type') || sel.includes(':only-of-type') ||
+          sel.includes('nth(') || sel.includes('eq(')) {
         groups.nth.push(selector);
+        continue;
       }
-      // Агрессивные селекторы (с низким score)
-      else if (selector.score < 40) {
+      // Агрессивные по структуре (вместо старого порога score)
+      if (isAggressiveSelector(sel)) {
         groups.aggressive.push(selector);
+        continue;
       }
-      // Остальные - базовые
-      else {
-        groups.basic.push(selector);
-      }
+      groups.basic.push(selector);
     }
     
     // Динамическая сортировка по новому рейтингу
@@ -1707,7 +1742,7 @@
     if (elementIndex >= 0) {
       const nthSel = `${tag}:nth-of-type(${elementIndex + 1})`;
       if (isUnique(nthSel, el)) {
-        out.push({sel: nthSel, score: 35});
+        out.push({sel: nthSel});
       }
     }
     
@@ -1720,10 +1755,10 @@
         const uniqueContext = findMinimalUniqueContext(el, partialText);
         if (uniqueContext) {
           const contextContainsSel = `cy.get('${uniqueContext}').contains('${partialText.replace(/'/g, "\\'")}')`;
-          out.push({sel: contextContainsSel, score: 45, isCypress: true});
+          out.push({sel: contextContainsSel, isCypress: true});
         } else if (isUniqueByText(el, partialText)) {
           const containsSel = `cy.contains('${partialText.replace(/'/g, "\\'")}')`;
-          out.push({sel: containsSel, score: 40, isCypress: true});
+          out.push({sel: containsSel, isCypress: true});
         }
       }
     }
@@ -1737,12 +1772,12 @@
           
           const attrSel = `[${name}="${esc(value)}"]`;
           if (isUnique(attrSel, el)) {
-            out.push({sel: attrSel, score: 40});
+            out.push({sel: attrSel});
           }
           
           const tagAttrSel = `${tag}[${name}="${esc(value)}"]`;
           if (isUnique(tagAttrSel, el)) {
-            out.push({sel: tagAttrSel, score: 42});
+            out.push({sel: tagAttrSel});
           }
         }
       }
@@ -1760,29 +1795,29 @@
       for (const cls of stableClasses.slice(0, 3)) {
         const classSel = `.${esc(cls)}`;
         if (isUnique(classSel, el)) {
-          out.push({sel: classSel, score: 45});
+          out.push({sel: classSel});
         }
         
         const tagClassSel = `${tag}.${esc(cls)}`;
         if (isUnique(tagClassSel, el)) {
-          out.push({sel: tagClassSel, score: 47});
+          out.push({sel: tagClassSel});
         }
       }
     }
     
     // 6. Простой селектор по тегу только если он уникален
     if (isUnique(tag, el)) {
-      out.push({sel: tag, score: 25});
+      out.push({sel: tag});
     }
     
     // 7. Минимальный уникальный позиционный селектор (короткий суффикс абсолютного пути)
     const minimalPositional = buildMinimalPositionalSelector(el);
     if (minimalPositional) {
-      out.push({ sel: minimalPositional, score: 8 });
+      out.push({ sel: minimalPositional });
     }
     
     // 8. Абсолютный CSS-путь (как самый низкоприоритетный запасной вариант)
-    out.push({ sel: buildAbsoluteCssPath(el), score: 5 });
+    out.push({ sel: buildAbsoluteCssPath(el) });
     
     return out;
   }
@@ -1884,9 +1919,9 @@
           ];
           
           for (const sel of selectors) {
-            if (isUnique(sel, el)) {
-              out.push({sel, score: 52 - depth});
-            }
+              if (isUnique(sel, el)) {
+                out.push({sel});
+              }
           }
         }
       }
@@ -1905,7 +1940,7 @@
             
             for (const sel of selectors) {
               if (isUnique(sel, el)) {
-                out.push({sel, score: 54 - depth});
+                out.push({sel});
               }
             }
           }
@@ -1933,7 +1968,7 @@
             
             for (const sel of selectors) {
               if (isUnique(sel, el)) {
-                out.push({sel, score: 48 - depth});
+                out.push({sel});
               }
             }
           }
@@ -1950,7 +1985,7 @@
             
             for (const sel of selectors) {
               if (isUnique(sel, el)) {
-                out.push({sel, score: 50 - depth});
+                out.push({sel});
               }
             }
           }
@@ -1970,7 +2005,7 @@
           
           for (const sel of selectors) {
             if (isUnique(sel, el)) {
-              out.push({sel, score: 44 - depth});
+              out.push({sel});
             }
           }
         }
@@ -2037,7 +2072,7 @@
           const pathSel = path.map(p => `${p.tag}:nth-child(${p.index})`).join(' > ');
           const fullSel = `${rootSel} > ${pathSel}`;
           if (isUnique(fullSel, el)) {
-            out.push({sel: fullSel, score: 30 - depth});
+            out.push({sel: fullSel});
           }
           break; // Нашли уникальный корень
         }
@@ -2052,7 +2087,7 @@
             const pathSel = path.map(p => `${p.tag}:nth-child(${p.index})`).join(' > ');
             const fullSel = `${rootSel} > ${pathSel}`;
             if (isUnique(fullSel, el)) {
-              out.push({sel: fullSel, score: 32 - depth});
+              out.push({sel: fullSel});
             }
             break;
           }
@@ -2086,12 +2121,12 @@
         if (distance === 1) {
           const adjSel = `${siblingId} + ${tag}`;
           if (isUnique(adjSel, el)) {
-            out.push({sel: adjSel, score: 38});
+            out.push({sel: adjSel});
           }
         } else {
           const genSel = `${siblingId} ~ ${tag}:nth-of-type(${distance})`;
           if (isUnique(genSel, el)) {
-            out.push({sel: genSel, score: 35});
+            out.push({sel: genSel});
           }
         }
       }
@@ -2109,7 +2144,7 @@
           if (distance === 1) {
             const adjSel = `${siblingClass} + ${tag}`;
             if (isUnique(adjSel, el)) {
-              out.push({sel: adjSel, score: 33});
+              out.push({sel: adjSel});
             }
           }
         }
@@ -2135,7 +2170,7 @@
         const partialValue = value.substring(0, Math.min(value.length - 2, 15));
         const partialSel = `${tag}[${name}^="${esc(partialValue)}"]`;
         if (isUnique(partialSel, el)) {
-          out.push({sel: partialSel, score: 28});
+          out.push({sel: partialSel});
         }
       }
       
@@ -2144,7 +2179,7 @@
         const endValue = value.substring(Math.max(0, value.length - 10));
         const endSel = `${tag}[${name}$="${esc(endValue)}"]`;
         if (isUnique(endSel, el)) {
-          out.push({sel: endSel, score: 26});
+          out.push({sel: endSel});
         }
       }
       
@@ -2155,7 +2190,7 @@
           if (part.length > 3 && !looksDynamic(part)) {
             const containsSel = `${tag}[${name}*="${esc(part)}"]`;
             if (isUnique(containsSel, el)) {
-              out.push({sel: containsSel, score: 24});
+              out.push({sel: containsSel});
             }
           }
         }
@@ -2181,21 +2216,21 @@
     if (index === 0) {
       const firstSel = `${tag}:first-child`;
       if (isUnique(firstSel, el)) {
-        out.push({sel: firstSel, score: 32});
+        out.push({sel: firstSel});
       }
     }
     
     if (index === siblings.length - 1) {
       const lastSel = `${tag}:last-child`;
       if (isUnique(lastSel, el)) {
-        out.push({sel: lastSel, score: 32});
+        out.push({sel: lastSel});
       }
     }
     
     if (siblings.length === 1) {
       const onlySel = `${tag}:only-child`;
       if (isUnique(onlySel, el)) {
-        out.push({sel: onlySel, score: 35});
+        out.push({sel: onlySel});
       }
     }
     
@@ -2203,21 +2238,21 @@
     if (sameTagIndex === 0) {
       const firstTypeSel = `${tag}:first-of-type`;
       if (isUnique(firstTypeSel, el)) {
-        out.push({sel: firstTypeSel, score: 30});
+        out.push({sel: firstTypeSel});
       }
     }
     
     if (sameTagIndex === sameTagSiblings.length - 1) {
       const lastTypeSel = `${tag}:last-of-type`;
       if (isUnique(lastTypeSel, el)) {
-        out.push({sel: lastTypeSel, score: 30});
+        out.push({sel: lastTypeSel});
       }
     }
     
     if (sameTagSiblings.length === 1) {
       const onlyTypeSel = `${tag}:only-of-type`;
       if (isUnique(onlyTypeSel, el)) {
-        out.push({sel: onlyTypeSel, score: 33});
+        out.push({sel: onlyTypeSel});
       }
     }
     
@@ -2228,12 +2263,12 @@
       if (index % 2 === 1) { // четный (nth-child считает с 1)
         const evenSel = `${tag}:nth-child(even)`;
         if (isUnique(evenSel, el)) {
-          out.push({sel: evenSel, score: 25});
+          out.push({sel: evenSel});
         }
       } else {
         const oddSel = `${tag}:nth-child(odd)`;
         if (isUnique(oddSel, el)) {
-          out.push({sel: oddSel, score: 25});
+          out.push({sel: oddSel});
         }
       }
     }
@@ -2323,17 +2358,17 @@
         const children = [...fromEl.children];
         if (children.length === 1) {
           // Единственный потомок - безопасно использовать children()
-          relationships.push({method: 'children()', score: 28});
+          relationships.push({method: 'children()'});
         } else {
           // Множественные потомки - используем более специфичный селектор
           const targetTag = toEl.tagName.toLowerCase();
           const sameTagChildren = children.filter(child => child.tagName.toLowerCase() === targetTag);
           
           if (sameTagChildren.length === 1) {
-            relationships.push({method: `children('${targetTag}')`, score: 26});
+            relationships.push({method: `children('${targetTag}')`});
           } else {
             const childIndex = children.indexOf(toEl);
-            relationships.push({method: `children().eq(${childIndex})`, score: 24});
+            relationships.push({method: `children().eq(${childIndex})`});
           }
         }
       } else {
@@ -2341,13 +2376,13 @@
         const descendants = fromEl.querySelectorAll('*');
         if (descendants.length === 1) {
           // Единственный потомок - безопасно
-          relationships.push({method: 'find("*")', score: 22});
+        relationships.push({method: 'find("*")'});
         } else {
           const targetTag = toEl.tagName.toLowerCase();
           const sameTagDescendants = fromEl.querySelectorAll(targetTag);
           
           if (sameTagDescendants.length === 1) {
-            relationships.push({method: `find('${targetTag}')`, score: 20});
+            relationships.push({method: `find('${targetTag}')`});
           } else {
             // Слишком много потомков - не используем
             // relationships не добавляем
@@ -2364,30 +2399,30 @@
       
       if (toIndex === fromIndex + 1) {
         // Следующий соседний элемент
-        relationships.push({method: 'next()', score: 30});
+        relationships.push({method: 'next()'});
       } else if (toIndex > fromIndex) {
         // Следующие элементы
         const nextElements = siblings.slice(fromIndex + 1);
         const targetInNext = nextElements.indexOf(toEl);
         
         if (nextElements.length === 1) {
-          relationships.push({method: 'nextAll()', score: 25});
+          relationships.push({method: 'nextAll()'});
         } else if (targetInNext >= 0) {
-          relationships.push({method: `nextAll().eq(${targetInNext})`, score: 23});
+          relationships.push({method: `nextAll().eq(${targetInNext})`});
         }
       } else if (toIndex === fromIndex - 1) {
         // Предыдущий соседний элемент
-        relationships.push({method: 'prev()', score: 30});
+        relationships.push({method: 'prev()'});
       } else if (toIndex < fromIndex) {
         // Предыдущие элементы
         const prevElements = siblings.slice(0, fromIndex);
         const targetInPrev = prevElements.indexOf(toEl);
         
         if (prevElements.length === 1) {
-          relationships.push({method: 'prevAll()', score: 25});
+          relationships.push({method: 'prevAll()'});
         } else if (targetInPrev >= 0) {
           const reverseIndex = prevElements.length - 1 - targetInPrev;
-          relationships.push({method: `prevAll().eq(${reverseIndex})`, score: 23});
+          relationships.push({method: `prevAll().eq(${reverseIndex})`});
         }
       }
     }
@@ -2396,7 +2431,7 @@
     if (toEl.contains(fromEl)) {
       // fromEl является потомком toEl
       if (toEl === fromEl.parentElement) {
-        relationships.push({method: 'parent()', score: 28});
+        relationships.push({method: 'parent()'});
       } else {
         // Более далекий предок - используем parents с селектором
         const targetTag = toEl.tagName.toLowerCase();
@@ -2408,7 +2443,7 @@
         }
         
         if (ancestors.length === 0) {
-          relationships.push({method: 'parent()', score: 28});
+          relationships.push({method: 'parent()'});
         } else {
           const sameTagAncestors = [];
           current = fromEl.parentElement;
@@ -2420,7 +2455,7 @@
           }
           
           if (sameTagAncestors.length === 1 && sameTagAncestors[0] === toEl) {
-            relationships.push({method: `parents('${targetTag}')`, score: 26});
+            relationships.push({method: `parents('${targetTag}')`});
           }
         }
       }
@@ -2488,7 +2523,7 @@
       const totalCount = groups.basicSelectors.length + groups.containsSelectors.length + groups.nthSelectors.length + (groups.aggressive?.length || 0);
       if (totalCount === 0) {
         const absPath = buildAbsoluteCssPath(el);
-        const fallback = [{ sel: absPath, score: 1 }];
+        const fallback = [{ sel: absPath }];
         createSelectorGroup(groupsContainer, 'Агрессивные селекторы (fallback)', fallback, [], availableActions, 'aggressive');
       }
     };
