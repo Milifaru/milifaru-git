@@ -14,6 +14,7 @@
     .__dompick-btn{cursor:pointer;border:1px solid #4b5563;background:#1f2937;color:#e5e7eb;border-radius:8px;padding:4px 8px;margin-left:4px;font-size:11px}
     .__dompick-btn:hover{background:#374151}
     .__dompick-highlight{outline:2px solid #ff0066; outline-offset:2px}
+    .__dompick-overlay{position:fixed;top:0;left:0;width:100vw;height:100vh;z-index:2147483646;cursor:crosshair;background:transparent}
     .__dompick-modal{position:fixed;inset:0;z-index:2147483647;display:flex;align-items:center;justify-content:center}
     .__dompick-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.45)}
     .__dompick-dialog{position:relative;background:#0b1020;color:#e5e7eb;width:min(920px,95vw);max-height:85vh;
@@ -37,6 +38,7 @@
     .__dompick-btn:hover{background:#374151}
     .__dompick-selector-row{display:grid;grid-template-columns:1fr auto;gap:12px;align-items:center;margin-bottom:8px}
     .__dompick-selector-row:last-child{margin-bottom:0}
+    /* (удалённый) toggle стили больше не используются */
   `;
   document.head.appendChild(styleEl);
 
@@ -44,6 +46,13 @@
   let currentHighlighted = null;
   let fixedHighlighted = null;
   let isCtrlPressed = false;
+  let isSelectionModeActive = false;
+  let overlayEl = null;
+  let lastHoveredElement = null;
+  // Режим вывода: 'cypress' | 'js'
+  let __dompickMode = 'cypress';
+  // Версия UI
+  const __dompickVersion = 'v1.04';
 
   // ==== Панель ====
   const panel = document.createElement('div');
@@ -51,15 +60,41 @@
   panel.innerHTML = `
     <div style="display: flex; justify-content: space-between; align-items: flex-start; width: 100%;">
       <div style="flex: 1;">
-        <div style="font-weight: bold; margin-bottom: 4px;">DOM Picker</div>
+        <div style="font-weight: bold; margin-bottom: 4px;">DOM Picker <span style="opacity:.6">${__dompickVersion}</span></div>
         <div class="__dompick-help" id="__dompick-help">
           <div>Ctrl+клик - показать селекторы</div>
+        </div>
+        <div style="margin-top:6px; display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+          <span style="opacity:.8">Режим:</span>
+          <button class="__dompick-btn" id="__dompick-mode-cypress">Cypress</button>
+          <button class="__dompick-btn" id="__dompick-mode-js">JS</button>
         </div>
       </div>
       <button class="__dompick-btn-close" id="__dompick-close">Закрыть</button>
     </div>
   `;
   document.body.appendChild(panel);
+
+  // Кнопки переключения режима
+  const modeBtnCypress = panel.querySelector('#__dompick-mode-cypress');
+  const modeBtnJs = panel.querySelector('#__dompick-mode-js');
+  const applyModeStyles = () => {
+    if (!modeBtnCypress || !modeBtnJs) return;
+    const activeStyle = 'background:#065f46;border-color:#059669;color:#10b981';
+    const inactiveStyle = 'background:#1f2937;border-color:#4b5563;color:#e5e7eb';
+    if (__dompickMode === 'js') {
+      modeBtnJs.style.cssText = activeStyle;
+      modeBtnCypress.style.cssText = inactiveStyle;
+    } else {
+      modeBtnCypress.style.cssText = activeStyle;
+      modeBtnJs.style.cssText = inactiveStyle;
+    }
+  };
+  if (modeBtnCypress && modeBtnJs) {
+    modeBtnCypress.addEventListener('click', () => { __dompickMode = 'cypress'; applyModeStyles(); });
+    modeBtnJs.addEventListener('click', () => { __dompickMode = 'js'; applyModeStyles(); });
+    applyModeStyles();
+  }
 
   // ==== Функции подсветки ====
   const highlightElement = (el) => {
@@ -139,6 +174,37 @@
   const esc = (s) => CSS.escape(s);
   const looksDynamic = (s='') => /\b\d{4,}\b|\b[a-f0-9]{6,}\b|__/i.test(s);
   const hasDigits = (s='') => /\d/.test(s);
+
+  // Эвристика: «листовой» инлайн-элемент, который следует оставлять как есть (не подниматься к родителю)
+  const isLeafInlineElement = (el) => {
+    if (!el || el.nodeType !== 1) return false;
+    const tag = el.tagName ? el.tagName.toLowerCase() : '';
+    // Явные «иконко-подобные» и мелкие инлайны
+    const leafTags = new Set(['i','svg','img','use','path','picture','source','sup','sub','b','strong','em','small','span']);
+    if (leafTags.has(tag) && (!el.children || el.children.length === 0)) return true;
+
+    // Классовые паттерны иконок
+    const classList = el.classList ? [...el.classList] : [];
+    if (classList.some(c => /^fa($|-)/.test(c) || c.includes('icon') || c.startsWith('mdi-') || c.startsWith('bi-'))) {
+      return true;
+    }
+
+    // Мелкие инлайн элементы без детей
+    try {
+      const cs = window.getComputedStyle(el);
+      const interactiveBlockers = new Set(['a','button','input','select','textarea','label']);
+      if (
+        cs && (cs.display === 'inline' || cs.display === 'inline-block') &&
+        (!el.children || el.children.length === 0) &&
+        !interactiveBlockers.has(tag)
+      ) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width <= 40 && rect.height <= 40) return true;
+      }
+    } catch {}
+
+    return false;
+  };
 
   // Конфиг весов (динамическая система рейтинга). Меняйте значения по необходимости.
   // Пояснения к каждому параметру ниже.
@@ -987,6 +1053,11 @@
         return originalEl;
       }
     } catch {}
+    // Если навели на «листовой» инлайн-элемент (иконка, одиночный span и т.п.) — не поднимаемся
+    if (isLeafInlineElement(originalEl)) {
+      return originalEl;
+    }
+
     let cur = el, depth = 0;
     
     while (cur && depth < 6){
@@ -1082,8 +1153,21 @@
     return out; 
   }
   function bySimilarAttrs(el){ const out=[]; const similarAttrs=findSimilarAttrs(el); for(const {name,value} of similarAttrs){ const s=`[${name}="${esc(value)}"]`; if(isUnique(s,el)) out.push({sel:s}); const s2=`${el.tagName.toLowerCase()}[${name}="${esc(value)}"]`; if(isUnique(s2,el)) out.push({sel:s2}); } return out; }
-  
-  // Генерация Cypress команд по тексту
+
+  // Построение JS-поиска по тексту в (необязательном) scope
+  function buildJsFindInScope(scopeSelector, tagOrStar, text, visibleOnly){
+    const safeScope = String(scopeSelector || '')
+      .replace(/\\/g, "\\\\")
+      .replace(/'/g, "\\'");
+    const base = scopeSelector ? `(document.querySelector('${safeScope}')||document)` : 'document';
+    const list = `${base}.querySelectorAll('${tagOrStar || '*'}')`;
+    const arr = `Array.from(${list})`;
+    const vis = visibleOnly ? ".filter(el => el && el.offsetParent !== null)" : '';
+    const txt = String(text).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    return `${arr}${vis}.find(el => el && el.textContent && el.textContent.includes('${txt}'))`;
+  }
+
+  // Генерация команд по тексту
   function byCypressText(el) {
     const out = [];
     const texts = getAllTexts(el);
@@ -1095,35 +1179,54 @@
       
       const escapedText = text.replace(/'/g, "\\'");
       
-      // ВАЖНО: cy.contains('текст') используем только если текст ГЛОБАЛЬНО уникален
-      if (isUniqueByText(el, text)) {
-        const containsCmd = `cy.contains('${escapedText}')`;
-        out.push({sel: containsCmd, isCypress: true});
-      }
-      
-      // cy.contains('tag', 'текст') - более специфичный, но тоже только если уникален
-      if (isUniqueByText(el, text, tag)) {
-        const containsWithTagCmd = `cy.contains('${tag}', '${escapedText}')`;
-        out.push({sel: containsWithTagCmd, isCypress: true});
-      }
-      
-      // Для элементов в специальных контейнерах - ОБЯЗАТЕЛЬНО используем контекст
-      const specialContainer = el.closest('.datepicker, .modal, .modal-body, .modal-content, .modal-dialog, .dropdown, .popup, .overlay, .sidebar, .panel');
-      if (specialContainer) {
-        const containerClass = specialContainer.classList[0];
-        if (containerClass && isUniqueByTextInParent(el, text, specialContainer)) {
-          const visibleContainsCmd = `cy.get('.${containerClass}').filter(':visible').contains('${escapedText}')`;
-          out.push({sel: visibleContainsCmd, isCypress: true});
+      if (__dompickMode === 'js') {
+        // Глобально уникальный текст
+        if (isUniqueByText(el, text)) {
+          out.push({ sel: buildJsFindInScope(null, '*', text, false), isJs: true });
         }
-      }
-      
-      // Если текст НЕ глобально уникален, НЕ добавляем простой cy.contains()
-      // Вместо этого ищем минимальный уникальный контекст
-      if (!isUniqueByText(el, text)) {
-        const uniqueContext = findMinimalUniqueContext(el, text);
-        if (uniqueContext) {
-          const contextContainsCmd = `cy.get('${uniqueContext}').contains('${escapedText}')`;
-          out.push({sel: contextContainsCmd, isCypress: true});
+        // Уникален среди тега
+        if (isUniqueByText(el, text, tag)) {
+          out.push({ sel: buildJsFindInScope(null, tag, text, false), isJs: true });
+        }
+        // Специальные контейнеры (видимый)
+        const specialContainer = el.closest('.datepicker, .modal, .modal-body, .modal-content, .modal-dialog, .dropdown, .popup, .overlay, .sidebar, .panel');
+        if (specialContainer) {
+          const containerClass = specialContainer.classList[0];
+          if (containerClass && isUniqueByTextInParent(el, text, specialContainer)) {
+            out.push({ sel: buildJsFindInScope(`.${containerClass}`, '*', text, true), isJs: true });
+          }
+        }
+        // Уникальный контекст
+        if (!isUniqueByText(el, text)) {
+          const uniqueContext = findMinimalUniqueContext(el, text);
+          if (uniqueContext) {
+            out.push({ sel: buildJsFindInScope(uniqueContext, '*', text, false), isJs: true });
+          }
+        }
+      } else {
+        // Режим Cypress
+        if (isUniqueByText(el, text)) {
+          const containsCmd = `cy.contains('${escapedText}')`;
+          out.push({sel: containsCmd, isCypress: true});
+        }
+        if (isUniqueByText(el, text, tag)) {
+          const containsWithTagCmd = `cy.contains('${tag}', '${escapedText}')`;
+          out.push({sel: containsWithTagCmd, isCypress: true});
+        }
+        const specialContainer = el.closest('.datepicker, .modal, .modal-body, .modal-content, .modal-dialog, .dropdown, .popup, .overlay, .sidebar, .panel');
+        if (specialContainer) {
+          const containerClass = specialContainer.classList[0];
+          if (containerClass && isUniqueByTextInParent(el, text, specialContainer)) {
+            const visibleContainsCmd = `cy.get('.${containerClass}').filter(':visible').contains('${escapedText}')`;
+            out.push({sel: visibleContainsCmd, isCypress: true});
+          }
+        }
+        if (!isUniqueByText(el, text)) {
+          const uniqueContext = findMinimalUniqueContext(el, text);
+          if (uniqueContext) {
+            const contextContainsCmd = `cy.get('${uniqueContext}').contains('${escapedText}')`;
+            out.push({sel: contextContainsCmd, isCypress: true});
+          }
         }
       }
     }
@@ -1152,8 +1255,12 @@
           const parentSel = `#${esc(p.id)}`;
           if (document.querySelectorAll(parentSel).length === 1) {
             if (isUniqueByTextInParent(el, text, p)) {
-              const cmd = `cy.get('${parentSel}').contains('${escapedText}')`;
-              out.push({sel: cmd, isCypress: true});
+              if (__dompickMode === 'js') {
+                out.push({ sel: buildJsFindInScope(parentSel, '*', text, false), isJs: true });
+              } else {
+                const cmd = `cy.get('${parentSel}').contains('${escapedText}')`;
+                out.push({sel: cmd, isCypress: true});
+              }
             }
           }
         }
@@ -1165,8 +1272,12 @@
             const parentSel = `[${attr}="${esc(value)}"]`;
             if (document.querySelectorAll(parentSel).length === 1) {
               if (isUniqueByTextInParent(el, text, p)) {
-                const cmd = `cy.get('${parentSel}').contains('${escapedText}')`;
-                out.push({sel: cmd, isCypress: true});
+                if (__dompickMode === 'js') {
+                  out.push({ sel: buildJsFindInScope(parentSel, '*', text, false), isJs: true });
+                } else {
+                  const cmd = `cy.get('${parentSel}').contains('${escapedText}')`;
+                  out.push({sel: cmd, isCypress: true});
+                }
               }
             }
           }
@@ -1186,8 +1297,12 @@
             const parentSel = `.${esc(cls)}`;
             if (document.querySelectorAll(parentSel).length === 1) {
               if (isUniqueByTextInParent(el, text, p)) {
-                const cmd = `cy.get('${parentSel}').contains('${escapedText}')`;
-                out.push({sel: cmd, isCypress: true});
+                if (__dompickMode === 'js') {
+                  out.push({ sel: buildJsFindInScope(parentSel, '*', text, false), isJs: true });
+                } else {
+                  const cmd = `cy.get('${parentSel}').contains('${escapedText}')`;
+                  out.push({sel: cmd, isCypress: true});
+                }
               }
             }
           }
@@ -1197,8 +1312,12 @@
             const parentSel = `.${esc(stableClasses[0])}.${esc(stableClasses[1])}`;
             if (document.querySelectorAll(parentSel).length === 1) {
               if (isUniqueByTextInParent(el, text, p)) {
-                const cmd = `cy.get('${parentSel}').contains('${escapedText}')`;
-                out.push({sel: cmd, isCypress: true});
+                if (__dompickMode === 'js') {
+                  out.push({ sel: buildJsFindInScope(parentSel, '*', text, false), isJs: true });
+                } else {
+                  const cmd = `cy.get('${parentSel}').contains('${escapedText}')`;
+                  out.push({sel: cmd, isCypress: true});
+                }
               }
             }
           }
@@ -1211,8 +1330,12 @@
           if (isUniqueByTextInParent(el, text, p)) {
             const sameTagContainers = document.querySelectorAll(parentTag);
             if (sameTagContainers.length <= 2) { // Только если семантический тег почти уникален
-              const cmd = `cy.get('${parentTag}').contains('${escapedText}')`;
-              out.push({sel: cmd, isCypress: true});
+              if (__dompickMode === 'js') {
+                out.push({ sel: buildJsFindInScope(parentTag, '*', text, false), isJs: true });
+              } else {
+                const cmd = `cy.get('${parentTag}').contains('${escapedText}')`;
+                out.push({sel: cmd, isCypress: true});
+              }
             }
           }
         }
@@ -1657,9 +1780,13 @@
       const texts = getAllTexts(el).filter(t => isGoodTextForContains(t));
       const shortText = texts.find(t => t.length <= 25);
       if (shortText) {
-        const escaped = shortText.replace(/'/g, "\\'");
-        const sel1 = `cy.get('${scope.scopeSelector}').contains('${escaped}')`;
-        addBatch([{ sel: sel1, isCypress: true }]);
+        if (__dompickMode === 'js') {
+          addBatch([{ sel: buildJsFindInScope(scope.scopeSelector, '*', shortText, false) }]);
+        } else {
+          const escaped = shortText.replace(/'/g, "\\'");
+          const sel1 = `cy.get('${scope.scopeSelector}').contains('${escaped}')`;
+          addBatch([{ sel: sel1, isCypress: true }]);
+        }
       }
     }
 
@@ -2474,7 +2601,7 @@
       <div class="__dompick-backdrop"></div>
       <div class="__dompick-dialog">
         <div class="__dompick-head">
-          <div class="__dompick-title">Селекторы для Cypress</div>
+          <div class="__dompick-title">Селекторы для ${__dompickMode === 'js' ? 'JS' : 'Cypress'}</div>
           <button class="__dompick-copy" data-close>✖</button>
         </div>
         <div class="__dompick-body">
@@ -2511,7 +2638,8 @@
       if (loading) loading.remove();
 
       createSelectorGroup(groupsContainer, 'Базовые селекторы', groups.basicSelectors, groups.moreBasic, availableActions, 'basic');
-      createSelectorGroup(groupsContainer, 'Селекторы с .contains', groups.containsSelectors, groups.moreContains, availableActions, 'contains');
+      const containsTitle = (__dompickMode === 'js') ? 'Селекторы по тексту' : 'Селекторы с .contains';
+      createSelectorGroup(groupsContainer, containsTitle, groups.containsSelectors, groups.moreContains, availableActions, 'contains');
       createSelectorGroup(groupsContainer, 'Позиционные селекторы', groups.nthSelectors, groups.moreNth, availableActions, 'nth');
 
       // Если есть агрессивные — тоже показываем
@@ -2597,6 +2725,86 @@
     container.appendChild(groupDiv);
   }
 
+  // Конвертация Cypress-цепочек в базовое JS-выражение (возвращает элемент)
+  function __escapeJsString(s){
+    try { return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'"); } catch { return s; }
+  }
+  function convertCypressToJsBase(cyExpr){
+    if (!cyExpr || typeof cyExpr !== 'string') return 'document.body';
+    let expr = cyExpr.trim().replace(/;\s*$/, '');
+    // cy.get('sel')
+    let m = expr.match(/^cy\.get\((['"])(.+?)\1\)$/);
+    if (m) {
+      const sel = __escapeJsString(m[2]);
+      return `document.querySelector('${sel}')`;
+    }
+    // cy.contains('text')
+    m = expr.match(/^cy\.contains\((['"])(.+?)\1\)$/);
+    if (m) {
+      const txt = __escapeJsString(m[2]);
+      return `Array.from(document.querySelectorAll('*')).find(el => el && el.textContent && el.textContent.includes('${txt}'))`;
+    }
+    // cy.contains('tag', 'text')
+    m = expr.match(/^cy\.contains\((['"])([a-zA-Z][a-zA-Z0-9-]*)\1,\s*(['"])(.+?)\3\)$/);
+    if (m) {
+      const tag = m[2].toLowerCase();
+      const txt = __escapeJsString(m[4]);
+      return `Array.from(document.querySelectorAll('${tag}')).find(el => el && el.textContent && el.textContent.includes('${txt}'))`;
+    }
+    // cy.get('sel').contains('text')
+    m = expr.match(/^cy\.get\((['"])(.+?)\1\)\.contains\((['"])(.+?)\3\)$/);
+    if (m) {
+      const sel = __escapeJsString(m[2]);
+      const txt = __escapeJsString(m[4]);
+      return `Array.from(document.querySelectorAll('${sel}')).find(el => el && el.textContent && el.textContent.includes('${txt}'))`;
+    }
+    // cy.get('sel').contains('tag','text')
+    m = expr.match(/^cy\.get\((['"])(.+?)\1\)\.contains\((['"])([a-zA-Z][a-zA-Z0-9-]*)\3,\s*(['"])(.+?)\5\)$/);
+    if (m) {
+      const scope = __escapeJsString(m[2]);
+      const tag = m[4].toLowerCase();
+      const txt = __escapeJsString(m[6]);
+      return `Array.from((document.querySelector('${scope}')||document).querySelectorAll('${tag}')).find(el => el && el.textContent && el.textContent.includes('${txt}'))`;
+    }
+    // cy.get('sel').filter(':visible').contains('text')
+    m = expr.match(/^cy\.get\((['"])(.+?)\1\)\.filter\('\:visible'\)\.contains\((['"])(.+?)\3\)$/);
+    if (m) {
+      const sel = __escapeJsString(m[2]);
+      const txt = __escapeJsString(m[4]);
+      return `Array.from(document.querySelectorAll('${sel}')).filter(el => el && el.offsetParent !== null).find(el => el.textContent && el.textContent.includes('${txt}'))`;
+    }
+    // cy.get('sel').filter(':visible').contains('tag','text')
+    m = expr.match(/^cy\.get\((['"])(.+?)\1\)\.filter\('\:visible'\)\.contains\((['"])([a-zA-Z][a-zA-Z0-9-]*)\3,\s*(['"])(.+?)\5\)$/);
+    if (m) {
+      const scope = __escapeJsString(m[2]);
+      const tag = m[4].toLowerCase();
+      const txt = __escapeJsString(m[6]);
+      return `Array.from((document.querySelector('${scope}')||document).querySelectorAll('${tag}')).filter(el => el && el.offsetParent !== null).find(el => el.textContent && el.textContent.includes('${txt}'))`;
+    }
+    // cy.get('sel').find('sub').eq(n)
+    m = expr.match(/^cy\.get\((['"])(.+?)\1\)\.find\((['"])(.+?)\3\)\.eq\((\d+)\)$/);
+    if (m) {
+      const scope = __escapeJsString(m[2]);
+      const sub = __escapeJsString(m[4]);
+      const idx = Number(m[5]) || 0;
+      return `Array.from((document.querySelector('${scope}')||document).querySelectorAll('${sub}'))[${idx}]`;
+    }
+    // cy.get('sel').find('sub')
+    m = expr.match(/^cy\.get\((['"])(.+?)\1\)\.find\((['"])(.+?)\3\)$/);
+    if (m) {
+      const scope = __escapeJsString(m[2]);
+      const sub = __escapeJsString(m[4]);
+      return `(document.querySelector('${scope}')||document).querySelector('${sub}')`;
+    }
+    // Любая другая форма: пробуем вытащить первый cy.get('...')
+    m = expr.match(/cy\.get\((['"])(.+?)\1\)/);
+    if (m) {
+      const sel = __escapeJsString(m[2]);
+      return `document.querySelector('${sel}')`;
+    }
+    return 'document.body';
+  }
+
   // Добавление селектора в группу
   function addSelectorToGroup(container, selector, availableActions, number) {
     const selectorRow = document.createElement('div');
@@ -2607,8 +2815,22 @@
     selectorRow.style.alignItems = 'center';
     selectorRow.style.marginBottom = '8px';
     
-    const displayText = selector.isCypress ? selector.sel : `cy.get('${selector.sel}')`;
-    const copyText = selector.isCypress ? selector.sel : `cy.get('${selector.sel}')`;
+    const buildBaseForMode = () => {
+      if (__dompickMode === 'js') {
+        if (selector.isCypress) {
+          return convertCypressToJsBase(selector.sel);
+        }
+        // Если селектор помечен как готовое JS-выражение, возвращаем как есть
+        if (selector.isJs) {
+          return selector.sel;
+        }
+        return `document.querySelector('${selector.sel}')`;
+      } else {
+        return selector.isCypress ? selector.sel : `cy.get('${selector.sel}')`;
+      }
+    };
+    const displayText = buildBaseForMode();
+    const copyText = displayText;
     
     // Левая часть - селектор
     const selectorPart = document.createElement('div');
@@ -2656,11 +2878,23 @@
       actionBtn.textContent = `.${action}()`;
       actionBtn.style.fontSize = '10px';
       actionBtn.addEventListener('click', () => {
-        const actionText = action === 'type' ? 
-          `${copyText}.${action}('текст');` :
-          action === 'select' ?
-          `${copyText}.${action}('значение');` :
-          `${copyText}.${action}();`;
+        let actionText = '';
+        if (__dompickMode === 'js') {
+          if (action === 'type') actionText = `${copyText}.value = 'текст';`;
+          else if (action === 'select') actionText = `${copyText}.value = 'значение';`;
+          else if (action === 'check') actionText = `${copyText}.checked = true;`;
+          else if (action === 'uncheck') actionText = `${copyText}.checked = false;`;
+          else if (action === 'clear') actionText = `${copyText}.value = '';`;
+          else {
+            actionText = `(() => { const el = ${copyText}; if (!el) return; const t = el.closest('a,button,[role="button"],input,summary,[onclick]') || el; try { t.scrollIntoView({block:'center', inline:'center'}); } catch(e){} try { t.focus({preventScroll:true}); } catch(e){} const rect = t.getBoundingClientRect(); const x = rect.left + Math.max(1, Math.floor(rect.width/2)); const y = rect.top + Math.max(1, Math.floor(rect.height/2)); const opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }; ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(type => t.dispatchEvent(new MouseEvent(type, opts))); })();`;
+          }
+        } else {
+          actionText = action === 'type' ? 
+            `${copyText}.${action}('текст');` :
+            action === 'select' ?
+            `${copyText}.${action}('значение');` :
+            `${copyText}.${action}();`;
+        }
         navigator.clipboard.writeText(actionText).then(() => showToast(`Скопировано: .${action}()`));
       });
       buttonsContainer.appendChild(actionBtn);
@@ -2673,15 +2907,110 @@
   }
 
   // ==== Обработчики событий ====
+  const activateSelectionMode = () => {
+    if (isSelectionModeActive) return;
+    isSelectionModeActive = true;
+    if (!overlayEl) {
+      overlayEl = document.createElement('div');
+      overlayEl.className = '__dompick-overlay';
+    }
+
+    const handleMove = (e) => {
+      const x = e.clientX;
+      const y = e.clientY;
+      // Временно скрываем overlay, чтобы получить реальный элемент под курсором
+      overlayEl.style.display = 'none';
+      const raw = document.elementFromPoint(x, y);
+      overlayEl.style.display = '';
+
+      // Если попали в нашу панель/модалку — игнорируем
+      if (!raw || raw === panel || (raw.closest && raw.closest('.__dompick-panel, .__dompick-modal'))) {
+        if (currentHighlighted && currentHighlighted !== fixedHighlighted) {
+          removeHighlight(currentHighlighted);
+          currentHighlighted = null;
+        }
+        lastHoveredElement = null;
+        return;
+      }
+
+      const target = snapTarget(raw);
+      if (!target || target === panel || panel.contains(target) || (target.closest && target.closest('.__dompick-panel, .__dompick-modal'))) {
+        return;
+      }
+
+      if (currentHighlighted && currentHighlighted !== fixedHighlighted && currentHighlighted !== target) {
+        removeHighlight(currentHighlighted);
+      }
+      currentHighlighted = target;
+      highlightElement(target);
+      lastHoveredElement = target;
+    };
+
+    const handleClick = (e) => {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      let target = lastHoveredElement;
+      if (!target) {
+        // На всякий случай определим элемент под кликом
+        overlayEl.style.display = 'none';
+        const raw = document.elementFromPoint(e.clientX, e.clientY);
+        overlayEl.style.display = '';
+        if (raw && !(raw === panel || (raw.closest && raw.closest('.__dompick-panel, .__dompick-modal')))) {
+          target = snapTarget(raw);
+        }
+      }
+
+      if (target && !(target === panel || panel.contains(target))) {
+        if (fixedHighlighted) {
+          removeHighlight(fixedHighlighted);
+        }
+        fixedHighlighted = target;
+        highlightElement(target);
+        openModalFor(target);
+      }
+
+      // После клика — выходим из режима
+      deactivateSelectionMode();
+    };
+
+    overlayEl.addEventListener('mousemove', handleMove, true);
+    overlayEl.addEventListener('click', handleClick, true);
+    document.body.appendChild(overlayEl);
+
+    // Сохраним ссылки на обработчики для безопасного снятия
+    overlayEl.__dompickMove = handleMove;
+    overlayEl.__dompickClick = handleClick;
+  };
+
+  const deactivateSelectionMode = () => {
+    if (!isSelectionModeActive) return;
+    isSelectionModeActive = false;
+    lastHoveredElement = null;
+    if (overlayEl) {
+      if (overlayEl.__dompickMove) overlayEl.removeEventListener('mousemove', overlayEl.__dompickMove, true);
+      if (overlayEl.__dompickClick) overlayEl.removeEventListener('click', overlayEl.__dompickClick, true);
+      if (overlayEl.parentNode) overlayEl.parentNode.removeChild(overlayEl);
+    }
+    // Убираем hover-подсветку, не трогая зафиксированную
+    if (currentHighlighted && currentHighlighted !== fixedHighlighted) {
+      removeHighlight(currentHighlighted);
+      currentHighlighted = null;
+    }
+  };
+
   function onKeyDown(e) {
     if (e.key === 'Control') {
       isCtrlPressed = true;
+      // Входим в режим выбора
+      activateSelectionMode();
     }
   }
 
   function onKeyUp(e) {
     if (e.key === 'Control') {
       isCtrlPressed = false;
+      // Выходим из режима выбора
+      deactivateSelectionMode();
       // Убираем hover подсветку когда отпускаем Ctrl
       if (currentHighlighted && currentHighlighted !== fixedHighlighted) {
         removeHighlight(currentHighlighted);
@@ -2738,9 +3067,7 @@
   }
 
   // Добавляем все обработчики
-  window.addEventListener('click', onClick, true);
-  window.addEventListener('mouseover', onMouseOver, true);
-  window.addEventListener('mouseout', onMouseOut, true);
+  // Клики/наведение теперь обрабатываются через Overlay в режиме выбора
   window.addEventListener('keydown', onKeyDown, true);
   window.addEventListener('keyup', onKeyUp, true);
 })();
