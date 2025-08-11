@@ -89,14 +89,14 @@ async function setTabState(tabId, isOn) {
 
 function updateAction(tabId, err = false) {
   const isOn = tabStates.get(tabId);
-  const base = isOn ? "icons/icon_on" : "icons/icon";
+  const base = isOn ? "icons/on" : "icons/off";
   chrome.action.setIcon({
     tabId,
     path: {
-      16: `${base}16.png`,
-      32: `${base}32.png`,
-      48: `${base}48.png`,
-      128: `${base}128.png`,
+      16: `${base}/16.png`,
+      32: `${base}/32.png`,
+      48: `${base}/48.png`,
+      128: `${base}/128.png`,
     },
   });
   chrome.action.setBadgeText({ tabId, text: err ? "ERR" : isOn ? "ON" : "" });

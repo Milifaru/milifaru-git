@@ -817,7 +817,7 @@ function makeDraggable(targetEl, handleEl, options = {}) {
   // Режим вывода: 'cypress' | 'js'
   let __dompickMode = 'cypress';
   // Версия UI
-  const __dompickVersion = 'v1.08';
+  const __dompickVersion = 'v1.09';
 
   // Глобальный кэш для селекторов в обоих режимах
   let __dompickSelectorCache = null;

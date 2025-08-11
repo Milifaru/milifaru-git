@@ -1,25 +1,25 @@
 {
   "manifest_version": 3,
-  "name": "DOMPick Helper Toggle",
+  "name": "Milifaru DOMPicker",
   "version": "1.0.0",
-  "description": "Toggle injection of helper.js for DOMPick.",
-  "permissions": ["action", "scripting", "tabs", "activeTab", "storage"],
+  "description": "Enable/disable DOMPick.",
+  "permissions": ["scripting", "tabs", "activeTab", "storage"],
   "host_permissions": ["<all_urls>"],
   "background": { "service_worker": "background.js" },
   "action": {
     "default_icon": {
-      "16": "icons/icon16.png",
-      "32": "icons/icon32.png",
-      "48": "icons/icon48.png",
-      "128": "icons/icon128.png"
+      "16": "icons/off/16.png",
+      "32": "icons/off/32.png",
+      "48": "icons/off/48.png",
+      "128": "icons/off/128.png"
     },
-    "default_title": "DOMPick Helper"
+    "default_title": "Milifaru DOMPicker"
   },
   "icons": {
-    "16": "icons/icon16.png",
-    "32": "icons/icon32.png",
-    "48": "icons/icon48.png",
-    "128": "icons/icon128.png"
+    "16": "icons/off/16.png",
+    "32": "icons/off/32.png",
+    "48": "icons/off/48.png",
+    "128": "icons/off/128.png"
   },
   "content_scripts": [
     {
