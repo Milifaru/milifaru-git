@@ -2,6 +2,281 @@
   if (window.__domPickerActive) { console.warn('DOM Picker уже активен'); return; }
   window.__domPickerActive = true;
 
+  // ==== УТИЛИТА ДЛЯ ПЕРЕТАСКИВАНИЯ (всегда целиком во вьюпорте) ====
+/**
+ * Делает элемент перетаскиваемым с прилипаниями к краям и гарантией полной видимости.
+ *
+ * @param {HTMLElement} targetEl
+ * @param {HTMLElement} handleEl
+ * @param {Object} options
+ * @param {boolean} [options.keepFixed=true]
+ * @param {'both'|'x'|'y'} [options.axis='both']
+ * @param {boolean} [options.snapOnDrop=true]
+ * @param {number}  [options.snapThreshold=24]
+ * @param {number}  [options.minLeft=0]
+ * @param {number}  [options.minTop=0]
+ * @param {number}  [options.minRight=0]
+ * @param {number}  [options.minBottom=0]
+ * @param {Function} [options.onDragStart]
+ * @param {Function} [options.onDrag]
+ * @param {Function} [options.onDragEnd]
+ */
+function makeDraggable(targetEl, handleEl, options = {}) {
+  if (!targetEl) return;
+  handleEl = handleEl || targetEl;
+
+  const opts = {
+    keepFixed: true,
+    axis: 'both',
+    snapOnDrop: true,
+    snapThreshold: 5,
+    minLeft: 0, minTop: 0, minRight: 0, minBottom: 0,
+    onDragStart: null, onDrag: null, onDragEnd: null,
+    ...options
+  };
+
+  // --- состояние драга
+  let dragging = false;
+  let startX = 0, startY = 0;        // координаты указателя при старте
+  let baseLeft = 0, baseTop = 0;     // абсолютная позиция ЭЛЕМЕНТА при старте (origin для дельты)
+  let lastAbsLeft = 0, lastAbsTop = 0; // последние рассчитанные абсолютные координаты
+  let rAF = null;
+
+  const setupPositioning = () => {
+    const cs = getComputedStyle(targetEl);
+    const pos = cs.position;
+    const rect = targetEl.getBoundingClientRect();
+
+    if (opts.keepFixed) {
+      if (pos !== 'fixed') {
+        targetEl.style.position = 'fixed';
+        targetEl.style.left = rect.left + 'px';
+        targetEl.style.top  = rect.top + 'px';
+        targetEl.style.right = 'auto';
+        targetEl.style.bottom = 'auto';
+      } else {
+        if (cs.left === 'auto' || cs.top === 'auto') {
+          targetEl.style.left = rect.left + 'px';
+          targetEl.style.top  = rect.top + 'px';
+          targetEl.style.right = 'auto';
+          targetEl.style.bottom = 'auto';
+        }
+      }
+    } else {
+      if (pos !== 'absolute' && pos !== 'fixed') {
+        targetEl.style.position = 'absolute';
+      }
+      if (cs.left === 'auto' || cs.top === 'auto') {
+        targetEl.style.left = rect.left + (window.scrollX || 0) + 'px';
+        targetEl.style.top  = rect.top  + (window.scrollY || 0) + 'px';
+        targetEl.style.right = 'auto';
+        targetEl.style.bottom = 'auto';
+      }
+    }
+  };
+
+  const viewportWH = () => ({
+    vw: Math.max(0, window.innerWidth || 0),
+    vh: Math.max(0, window.innerHeight || 0),
+  });
+
+  const elementWH = () => ({
+    w: Math.max(0, targetEl.offsetWidth || 0),
+    h: Math.max(0, targetEl.offsetHeight || 0),
+  });
+
+  // Абсолютные координаты зажимаем в видимую область
+  const clampFullyVisible = (left, top) => {
+    const { vw, vh } = viewportWH();
+    const { w, h } = elementWH();
+    const minLeft = opts.minLeft;
+    const minTop  = opts.minTop;
+    const maxLeft = Math.max(minLeft, vw - w - opts.minRight);
+    const maxTop  = Math.max(minTop,  vh - h - opts.minBottom);
+
+    let L = Math.min(Math.max(left, minLeft), maxLeft);
+    let T = Math.min(Math.max(top,  minTop ), maxTop);
+
+    return { left: L, top: T, vw, vh, w, h };
+  };
+
+  // Притяжение к ближайшему краю (по абсолютным координатам)
+  const applyEdgeSnap = (left, top) => {
+    const { vw, vh, w, h } = clampFullyVisible(left, top);
+
+    const dLeft   = left;
+    const dRight  = vw - (left + w);
+    const dTop    = top;
+    const dBottom = vh - (top + h);
+
+    const minD = Math.min(dLeft, dRight, dTop, dBottom);
+    if (minD > opts.snapThreshold) return { left, top };
+
+    if (dLeft === minD)       left = 0 + opts.minLeft;
+    else if (dRight === minD) left = vw - w - opts.minRight;
+    else if (dTop === minD)   top  = 0 + opts.minTop;
+    else                      top  = vh - h - opts.minBottom;
+
+    const safe = clampFullyVisible(left, top);
+    return { left: safe.left, top: safe.top };
+  };
+
+  // Рендерим ДЕЛЬТУ от точки старта (исправление «улёта»)
+  const renderDelta = (absLeft, absTop) => {
+    lastAbsLeft = absLeft;
+    lastAbsTop  = absTop;
+    const dx = Math.round(absLeft - baseLeft);
+    const dy = Math.round(absTop  - baseTop);
+    targetEl.style.transform = `translate3d(${dx}px, ${dy}px, 0)`;
+  };
+
+  const commitPosition = (absLeft, absTop) => {
+    targetEl.style.transform = 'none';
+    targetEl.style.left = Math.round(absLeft) + 'px';
+    targetEl.style.top  = Math.round(absTop)  + 'px';
+  };
+
+  const onPointerDown = (e) => {
+    if (e.button !== 0) return;
+    dragging = true;
+
+    setupPositioning();
+
+    // отключаем анимации на время драга
+    targetEl.__prevTransition = targetEl.style.transition;
+    targetEl.style.transition = 'none';
+    targetEl.style.willChange = 'transform';
+    handleEl.style.cursor = 'grabbing';
+    document.body.classList.add('__dragging');
+
+    // стартовые значения
+    const curLeft = parseFloat(getComputedStyle(targetEl).left) || 0;
+    const curTop  = parseFloat(getComputedStyle(targetEl).top)  || 0;
+
+    // сразу нормализуем старт внутрь вьюпорта (без видимого рывка)
+    const safe = clampFullyVisible(curLeft, curTop);
+    commitPosition(safe.left, safe.top);
+
+    // база для дельт
+    baseLeft = safe.left;
+    baseTop  = safe.top;
+
+    // координаты указателя
+    startX = e.clientX;
+    startY = e.clientY;
+
+    try { handleEl.setPointerCapture?.(e.pointerId); } catch {}
+    e.preventDefault();
+    opts.onDragStart && opts.onDragStart(e);
+
+    // первый кадр — нулевая дельта
+    renderDelta(baseLeft, baseTop);
+
+    window.addEventListener('pointermove', onPointerMove, true);
+    window.addEventListener('pointerup', onPointerUp, true);
+    window.addEventListener('pointercancel', onPointerUp, true);
+  };
+
+  const onPointerMove = (e) => {
+    if (!dragging) return;
+
+    // дельты курсора
+    let dx = e.clientX - startX;
+    let dy = e.clientY - startY;
+    if (opts.axis === 'x') dy = 0;
+    if (opts.axis === 'y') dx = 0;
+
+    // абсолютная цель
+    let nextLeft = baseLeft + dx;
+    let nextTop  = baseTop  + dy;
+
+    // зажимаем в видимую область по абсолютным координатам
+    const safe = clampFullyVisible(nextLeft, nextTop);
+    nextLeft = safe.left;
+    nextTop  = safe.top;
+
+    // рендерим дельту (без «двойного смещения»)
+    if (!rAF) {
+      rAF = requestAnimationFrame(() => {
+        rAF = null;
+        renderDelta(nextLeft, nextTop);
+        opts.onDrag && opts.onDrag(e, { left: nextLeft, top: nextTop });
+      });
+    }
+  };
+
+  const onPointerUp = (e) => {
+    if (!dragging) return;
+    dragging = false;
+
+    if (rAF) { cancelAnimationFrame(rAF); rAF = null; }
+
+    // последние абсолютные координаты с учётом клампа
+    let finalLeft = lastAbsLeft;
+    let finalTop  = lastAbsTop;
+
+    // прилипание к краям при отпускании
+    if (opts.snapOnDrop) {
+      const snapped = applyEdgeSnap(finalLeft, finalTop);
+      finalLeft = snapped.left;
+      finalTop  = snapped.top;
+    }
+
+    // коммит и финальный спасательный кламп
+    commitPosition(finalLeft, finalTop);
+    requestAnimationFrame(() => {
+      const cssLeft = parseFloat(getComputedStyle(targetEl).left) || 0;
+      const cssTop  = parseFloat(getComputedStyle(targetEl).top)  || 0;
+      const safe = clampFullyVisible(cssLeft, cssTop);
+      if (safe.left !== cssLeft || safe.top !== cssTop) {
+        commitPosition(safe.left, safe.top);
+      }
+    });
+
+    // откатываем стили
+    targetEl.style.willChange = '';
+    targetEl.style.transition = targetEl.__prevTransition || '';
+    delete targetEl.__prevTransition;
+    handleEl.style.cursor = 'grab';
+    document.body.classList.remove('__dragging');
+
+    opts.onDragEnd && opts.onDragEnd(e, { left: finalLeft, top: finalTop });
+
+    window.removeEventListener('pointermove', onPointerMove, true);
+    window.removeEventListener('pointerup', onPointerUp, true);
+    window.removeEventListener('pointercancel', onPointerUp, true);
+    try { handleEl.releasePointerCapture?.(e.pointerId); } catch {}
+  };
+
+  const onResize = () => {
+    const curLeft = parseFloat(getComputedStyle(targetEl).left) || 0;
+    const curTop  = parseFloat(getComputedStyle(targetEl).top)  || 0;
+    const safe = clampFullyVisible(curLeft, curTop);
+    commitPosition(safe.left, safe.top);
+  };
+
+  // инициализация
+  setupPositioning();
+  handleEl.style.touchAction = 'none';
+  handleEl.style.cursor = 'grab';
+
+  handleEl.addEventListener('pointerdown', onPointerDown, true);
+  window.addEventListener('resize', onResize, { passive: true });
+
+  return {
+    destroy() {
+      handleEl.removeEventListener('pointerdown', onPointerDown, true);
+      window.removeEventListener('resize', onResize, { passive: true });
+      window.removeEventListener('pointermove', onPointerMove, true);
+      window.removeEventListener('pointerup', onPointerUp, true);
+      window.removeEventListener('pointercancel', onPointerUp, true);
+      document.body.classList.remove('__dragging');
+      if (rAF) { cancelAnimationFrame(rAF); rAF = null; }
+    }
+  };
+}
+
+
   // Очистка "хвостов" от предыдущего запуска
   document.querySelectorAll('.__dompick-modal, .__dompick-overlay').forEach(n => n.remove());
   document.querySelectorAll('.__dompick-highlight').forEach(el => el.classList.remove('__dompick-highlight'));
@@ -88,7 +363,8 @@
       border-radius: 12px;
       box-shadow: 0 10px 30px var(--dompick-shadow);
       padding: 10px 12px;
-      min-width: 260px;
+      width: 325px;
+      max-width: 95vw;
       display: flex;
       justify-content: space-between;
       align-items: center;
@@ -150,6 +426,23 @@
       left: 100%;
     }
 
+    /* Ручка перетаскивания */
+    .__dompick-drag {
+      cursor: move;
+      border: 1px solid var(--dompick-border-secondary);
+      background: var(--dompick-bg-secondary);
+      color: var(--dompick-text-primary);
+      border-radius: 8px;
+      padding: 4px 8px;
+      transition: var(--dompick-transition);
+      line-height: 1;
+      user-select: none;
+    }
+    .__dompick-drag:hover {
+      background: var(--dompick-border-primary);
+      transform: translateY(-1px);
+    }
+
     .__dompick-highlight {
       outline: 2px solid var(--dompick-accent-primary);
       outline-offset: 2px;
@@ -193,7 +486,8 @@
       position: relative;
       background: var(--dompick-bg-dialog);
       color: var(--dompick-text-primary);
-      width: min(920px,95vw);
+      width: 920px;
+      max-width: 95vw;
       max-height: 85vh;
       border: 1px solid var(--dompick-border-dialog);
       border-radius: 14px;
@@ -499,6 +793,17 @@
       color: var(--dompick-accent-tertiary);
       box-shadow: 0 0 0 2px var(--dompick-accent-primary), 0 4px 12px rgba(0, 0, 0, 0.3);
     }
+
+    /* Оптимизация на время перетаскивания */
+    .__dompick-dragging * {
+      transition: none !important;
+    }
+    .__dompick-dragging .__dompick-backdrop {
+      backdrop-filter: none !important;
+    }
+    .__dompick-panel {
+      will-change: transform;
+    }
   `;
   document.head.appendChild(styleEl);
 
@@ -526,9 +831,6 @@
       <div style="flex: 1;">
         <div style="font-weight: bold; margin-bottom: 4px; color: var(--dompick-text-primary);">
           DOM Picker <span style="opacity:.6; color: var(--dompick-text-secondary);">${__dompickVersion}</span>
-          <span id="__dompick-mode-indicator" style="margin-left:8px; font-size:10px; padding:2px 6px; border-radius:4px; background:var(--dompick-accent-secondary); color:var(--dompick-accent-tertiary);">
-            ${__dompickMode === 'js' ? '🔧 JS' : '⚡ Cypress'}
-          </span>
         </div>
         <div class="__dompick-help" id="__dompick-help">
           <div>Ctrl+клик - показать селекторы</div>
@@ -543,10 +845,26 @@
           </button>
         </div>
       </div>
-      <button class="__dompick-btn-close" id="__dompick-close">Закрыть</button>
+      <div style="display:flex; gap:6px; align-items:center;">
+        <button class="__dompick-drag" id="__dompick-drag-panel" title="Перетащить панель">⠿</button>
+        <button class="__dompick-btn-close" id="__dompick-close">Закрыть</button>
+      </div>
     </div>
   `;
   document.body.appendChild(panel);
+
+  // ==== Функции подсветки ====
+  // Сделаем панель перетаскиваемой за ручку
+  try {
+    const dragHandlePanel = panel.querySelector('#__dompick-drag-panel');
+    if (dragHandlePanel) {
+      // Для панели сохраняем фиксированное позиционирование (fixed)
+      makeDraggable(panel, dragHandlePanel, { constrainToViewport: true, keepFixed: true });
+      // Инициал: зафиксируем стартовые координаты, чтобы не "прыгало" при первом переносе
+      const r = panel.getBoundingClientRect();
+      panel.style.left = `${r.left}px`; panel.style.top = `${r.top}px`; panel.style.right = 'auto'; panel.style.bottom = 'auto';
+    }
+  } catch {}
 
   // Кнопки переключения режима
   const modeBtnCypress = panel.querySelector('#__dompick-mode-cypress');
