@@ -52,7 +52,7 @@
   // Режим вывода: 'cypress' | 'js'
   let __dompickMode = 'cypress';
   // Версия UI
-  const __dompickVersion = 'v1.04';
+  const __dompickVersion = 'v1.08';
 
   // ==== Панель ====
   const panel = document.createElement('div');
@@ -1159,12 +1159,11 @@
     const safeScope = String(scopeSelector || '')
       .replace(/\\/g, "\\\\")
       .replace(/'/g, "\\'");
-    const base = scopeSelector ? `(document.querySelector('${safeScope}')||document)` : 'document';
-    const list = `${base}.querySelectorAll('${tagOrStar || '*'}')`;
-    const arr = `Array.from(${list})`;
-    const vis = visibleOnly ? ".filter(el => el && el.offsetParent !== null)" : '';
     const txt = String(text).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-    return `${arr}${vis}.find(el => el && el.textContent && el.textContent.includes('${txt}'))`;
+    const safeTag = String(tagOrStar || '*').replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const base = scopeSelector ? `(document.querySelector('${safeScope}')||document)` : 'document';
+    const iife = `(()=>{ const baseEl=${base}; const list=Array.from(baseEl.querySelectorAll('${safeTag}')); let cand=list.filter(el=>el&&el.textContent&&el.textContent.includes('${txt}')); ${visibleOnly ? "cand=cand.filter(el=>el&&el.offsetParent!==null);" : ''} if(!cand.length) return null; const depth=(n)=>{let d=0; for(let p=n; p; p=p.parentElement) d++; return d;}; cand.sort((a,b)=>{ const da=depth(a), db=depth(b); if(da!==db) return db-da; const ra=a.getBoundingClientRect(), rb=b.getBoundingClientRect(); const aa=(ra.width||0)*(ra.height||0), ab=(rb.width||0)*(rb.height||0); return aa-ab; }); return cand[0]; })()`;
+    return iife;
   }
 
   // Генерация команд по тексту
@@ -1849,7 +1848,7 @@
     groups.basic.sort(sortByQuality);
     groups.contains.sort(sortByQuality);
     groups.nth.sort(sortByQuality);
-    // Агрессивные можно оставить без сложной сортировки
+    groups.aggressive.sort(sortByQuality);
     
     return groups;
   }
@@ -1873,19 +1872,24 @@
       }
     }
     
-    // 3. Селекторы через текстовое содержимое с контекстом
+    // 3. Селектор по тексту для JS-режима: выбираем ближайший визуально подходящий узел
     const textContent = el.textContent?.trim();
-    if (textContent && textContent.length > 0 && textContent.length < 30) {
-      const partialText = textContent.substring(0, 15);
-      if (partialText.length > 2) {
-        // Ищем уникальный контекст для текста
-        const uniqueContext = findMinimalUniqueContext(el, partialText);
-        if (uniqueContext) {
-          const contextContainsSel = `cy.get('${uniqueContext}').contains('${partialText.replace(/'/g, "\\'")}')`;
-          out.push({sel: contextContainsSel, isCypress: true});
-        } else if (isUniqueByText(el, partialText)) {
-          const containsSel = `cy.contains('${partialText.replace(/'/g, "\\'")}')`;
-          out.push({sel: containsSel, isCypress: true});
+    if (textContent && textContent.length > 0 && textContent.length < 50) {
+      const sample = textContent.length > 25 ? textContent.substring(0, 25) : textContent;
+      if (__dompickMode === 'js') {
+        const jsExpr = buildJsFindInScope(null, '*', sample, false);
+        out.push({ sel: jsExpr, __targetEl: el });
+      } else {
+        const partialText = sample;
+        if (partialText.length > 2) {
+          const uniqueContext = findMinimalUniqueContext(el, partialText);
+          if (uniqueContext) {
+            const contextContainsSel = `cy.get('${uniqueContext}').contains('${partialText.replace(/'/g, "\\'")}')`;
+            out.push({sel: contextContainsSel, isCypress: true});
+          } else if (isUniqueByText(el, partialText)) {
+            const containsSel = `cy.contains('${partialText.replace(/'/g, "\\'")}')`;
+            out.push({sel: containsSel, isCypress: true});
+          }
         }
       }
     }
@@ -2690,11 +2694,11 @@
       addSelectorToGroup(selectorsContainer, selector, availableActions, index + 1);
     });
     
-    // Кнопка "Сгенерировать ещё вариантов" если есть дополнительные селекторы
+    // Кнопка "Показать ещё вариантов" если есть дополнительные селекторы
     if (moreSelectors.length > 0) {
       const moreButton = document.createElement('button');
       moreButton.className = '__dompick-btn';
-      moreButton.textContent = `Сгенерировать ещё вариантов (${moreSelectors.length})`;
+      moreButton.textContent = `Показать ещё вариантов (${moreSelectors.length})`;
       moreButton.style.marginTop = '8px';
       moreButton.style.fontSize = '11px';
       
@@ -2711,7 +2715,7 @@
         // Обновляем кнопку
         const remaining = moreSelectors.length - additionalCount;
         if (remaining > 0) {
-          moreButton.textContent = `Ещё варианты (${remaining})`;
+          moreButton.textContent = `Показать ещё вариантов (${remaining})`;
           // Убираем показанные селекторы из массива
           moreSelectors.splice(0, additionalCount);
         } else {
@@ -2885,9 +2889,7 @@
           else if (action === 'check') actionText = `${copyText}.checked = true;`;
           else if (action === 'uncheck') actionText = `${copyText}.checked = false;`;
           else if (action === 'clear') actionText = `${copyText}.value = '';`;
-          else {
-            actionText = `(() => { const el = ${copyText}; if (!el) return; const t = el.closest('a,button,[role="button"],input,summary,[onclick]') || el; try { t.scrollIntoView({block:'center', inline:'center'}); } catch(e){} try { t.focus({preventScroll:true}); } catch(e){} const rect = t.getBoundingClientRect(); const x = rect.left + Math.max(1, Math.floor(rect.width/2)); const y = rect.top + Math.max(1, Math.floor(rect.height/2)); const opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }; ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(type => t.dispatchEvent(new MouseEvent(type, opts))); })();`;
-          }
+          else actionText = `${copyText}.click();`;
         } else {
           actionText = action === 'type' ? 
             `${copyText}.${action}('текст');` :
