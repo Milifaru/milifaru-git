@@ -25,7 +25,7 @@
         strategyBudgetMs: Number(window.__dompickStrategyBudgetMs || 150),
         targetEnoughBasic: Number(window.__dompickTargetEnoughBasic || 3),
         maxDescendantsForTextSearch: Number(window.__dompickMaxDescendantsForTextSearch || 400),
-        domSizeSoftCap: Number(window.__dompickDomSizeSoftCap || 4000),
+        domSizeSoftCap: Number(window.__dompickDomSizeSoftCap || 8000),
       };
     } catch (_) {
       return { 
@@ -776,7 +776,7 @@ function makeDraggable(targetEl, handleEl, options = {}) {
       grid-template-columns: 1fr auto auto;
       gap: 12px;
       align-items: center;
-      margin-bottom = '8px';
+      margin-bottom: 8px;
     }
 
     .__dompick-selector-row:last-child {
@@ -954,7 +954,7 @@ function makeDraggable(targetEl, handleEl, options = {}) {
   // Режим вывода: 'cypress' | 'js'
   let __dompickMode = 'cypress';
   // Версия UI
-  const __dompickVersion = 'v1.09';
+  const __dompickVersion = 'v1.12';
 
   // Глобальный кэш для селекторов в обоих режимах
   let __dompickSelectorCache = null;
@@ -1082,12 +1082,12 @@ function makeDraggable(targetEl, handleEl, options = {}) {
       const availableActions = getAvailableActions(__dompickCachedElement);
       const cachedGroups = __dompickSelectorCache[__dompickMode];
       
-      createSelectorGroup(groupsContainer, 'Базовые селекторы', cachedGroups.basicSelectors, cachedGroups.moreBasic, availableActions, 'basic');
+      createSelectorGroup(groupsContainer, 'Базовые селекторы CSS', cachedGroups.basicSelectors, cachedGroups.moreBasic, availableActions, 'basic');
       const containsTitle = (__dompickMode === 'js') ? 'Селекторы по тексту' : 'Селекторы с .contains';
       createSelectorGroup(groupsContainer, containsTitle, cachedGroups.containsSelectors, cachedGroups.moreContains, availableActions, 'contains');
       createSelectorGroup(groupsContainer, 'Позиционные селекторы', cachedGroups.nthSelectors, cachedGroups.moreNth, availableActions, 'nth');
-
-      if (cachedGroups.aggressive && cachedGroups.aggressive.length > 0) {
+      createSelectorGroup(groupsContainer, 'XPath селекторы', cachedGroups.xpathSelectors || [], cachedGroups.moreXPath || [], availableActions, 'xpath');
+        if (cachedGroups.aggressive && cachedGroups.aggressive.length > 0) {
         createSelectorGroup(groupsContainer, 'Агрессивные селекторы', cachedGroups.aggressive.slice(0, 5), cachedGroups.aggressive.slice(5), availableActions, 'aggressive');
       }
       return;
@@ -1129,17 +1129,17 @@ function makeDraggable(targetEl, handleEl, options = {}) {
       
       const availableActions = getAvailableActions(__dompickCachedElement);
       
-      createSelectorGroup(groupsContainer, 'Базовые селекторы', groups.basicSelectors, groups.moreBasic, availableActions, 'basic');
+      createSelectorGroup(groupsContainer, 'Базовые селекторы CSS', groups.basicSelectors, groups.moreBasic, availableActions, 'basic');
       const containsTitle = (__dompickMode === 'js') ? 'Селекторы по тексту' : 'Селекторы с .contains';
       createSelectorGroup(groupsContainer, containsTitle, groups.containsSelectors, groups.moreContains, availableActions, 'contains');
       createSelectorGroup(groupsContainer, 'Позиционные селекторы', groups.nthSelectors, groups.moreNth, availableActions, 'nth');
-
+      createSelectorGroup(groupsContainer, 'XPath селекторы', groups.xpathSelectors || [], groups.moreXPath || [], availableActions, 'xpath');
       if (groups.aggressive && groups.aggressive.length > 0) {
         createSelectorGroup(groupsContainer, 'Агрессивные селекторы', groups.aggressive.slice(0, 5), groups.aggressive.slice(5), availableActions, 'aggressive');
       }
       
       // ГАРАНТИЯ: если ни одного селектора не сгенерировалось — формируем абсолютный CSS‑путь
-      const totalCount = groups.basicSelectors.length + groups.containsSelectors.length + groups.nthSelectors.length + (groups.aggressive?.length || 0);
+      const totalCount = groups.basicSelectors.length + groups.containsSelectors.length + groups.nthSelectors.length + (groups.xpathSelectors?.length || 0) + (groups.aggressive?.length || 0);
       if (totalCount === 0) {
         const absPath = buildAbsoluteCssPath(__dompickCachedElement);
         const fallback = [{ sel: absPath }];
@@ -1595,6 +1595,152 @@ function makeDraggable(targetEl, handleEl, options = {}) {
       return list.length === 1 && list[0] === el;
     } catch { return false; }
   };
+
+
+// === XPath helpers ===
+function __xpathLiteral(value) {
+  const s = String(value);
+  if (!s.includes("'")) return "'" + s + "'";
+  const parts = s.split("'").map(part => "'" + part + "'");
+  return "concat(" + parts.join(", \"'\", ") + ")";
+}
+
+function isUniqueXPath(xpath, el) {
+  try {
+    const doc = el && el.ownerDocument ? el.ownerDocument : document;
+    const result = doc.evaluate(xpath, doc, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+    return result.snapshotLength === 1 && result.snapshotItem(0) === el;
+  } catch {
+    return false;
+  }
+}
+
+function buildAbsoluteXPath(node) {
+  if (!node || node.nodeType !== 1) return null;
+  const segments = [];
+  for (let el = node; el && el.nodeType === 1; el = el.parentElement) {
+    let tag = el.tagName.toLowerCase();
+    let index = 1, sameTagCount = 0;
+    if (el.parentElement) {
+      const siblings = el.parentElement.children;
+      for (let i = 0; i < siblings.length; i++) {
+        const sib = siblings[i];
+        if (sib.tagName && sib.tagName.toLowerCase() === tag) {
+          sameTagCount++;
+          if (sib === el) index = sameTagCount;
+        }
+      }
+      if (sameTagCount > 1) tag += `[${index}]`;
+    }
+    segments.unshift(tag);
+  }
+  return '/' + segments.join('/');
+}
+
+function byXPath(el) {
+  const out = [];
+  if (!el || el.nodeType !== 1) return out;
+  const tag = el.tagName.toLowerCase();
+
+  // 1) id
+  if (el.id && el.id.length < 80 && !/%|\/|\s/.test(el.id)) {
+    const lit = __xpathLiteral(el.id);
+    const xp1 = `//*[@id=${lit}]`;
+    if (isUniqueXPath(xp1, el)) out.push({ sel: xp1, isXPath: true });
+    const xp2 = `//${tag}[@id=${lit}]`;
+    if (isUniqueXPath(xp2, el)) out.push({ sel: xp2, isXPath: true });
+  }
+
+  // 2) preferred data-* attributes
+  try {
+    const pref = ['data-testid','data-test','data-cy','data-qa','data-test-id','data-automation-id','for'];
+    for (const a of pref) {
+      const v = el.getAttribute && el.getAttribute(a);
+      if (!v || v.length > 120 || /^\s*$/.test(v)) continue;
+      const lit = __xpathLiteral(v);
+      const xp1 = `//*[@${a}=${lit}]`;
+      if (isUniqueXPath(xp1, el)) out.push({ sel: xp1, isXPath: true });
+      const xp2 = `//${tag}[@${a}=${lit}]`;
+      if (isUniqueXPath(xp2, el)) out.push({ sel: xp2, isXPath: true });
+    }
+  } catch {}
+
+  // 3) role + aria-label
+  const role = el.getAttribute && el.getAttribute('role');
+  const aria = el.getAttribute && el.getAttribute('aria-label');
+  if (role && aria) {
+    const xp = `//${tag}[@role=${__xpathLiteral(role)} and @aria-label=${__xpathLiteral(aria)}]`;
+    if (isUniqueXPath(xp, el)) out.push({ sel: xp, isXPath: true });
+    const xp2 = `//*[@role=${__xpathLiteral(role)} and @aria-label=${__xpathLiteral(aria)}]`;
+    if (isUniqueXPath(xp2, el)) out.push({ sel: xp2, isXPath: true });
+  }
+
+  // 4) другие устойчивые атрибуты
+  const okAttrs = ['name','type','placeholder','href','value','title'];
+  for (const a of okAttrs) {
+    const v = el.getAttribute && el.getAttribute(a);
+    if (!v || v.length > 120 || /^\s*$/.test(v)) continue;
+    const lit = __xpathLiteral(v);
+    const xp1 = `//${tag}[@${a}=${lit}]`;
+    if (isUniqueXPath(xp1, el)) out.push({ sel: xp1, isXPath: true });
+  }
+
+  // 5) короткий класс (без цифр) — осторожно
+  if (el.classList && el.classList.length) {
+    for (const c of el.classList) {
+      // Пропускаем классы, добавленные самим скриптом
+      if (c.startsWith('__dompick')) continue;
+      if (!/\d/.test(c) && c.length <= 40) {
+        const xp = `//${tag}[contains(concat(' ', normalize-space(@class), ' '), ' ${c} ')]`;
+        if (isUniqueXPath(xp, el)) out.push({ sel: xp, isXPath: true });
+      }
+    }
+  }
+
+  // 6) контекст от стабильного предка
+  let cur = el.parentElement;
+  while (cur && cur.nodeType === 1) {
+    let base = null;
+    if (cur.id && !/%|\/|\s/.test(cur.id)) {
+      base = `//*[@id=${__xpathLiteral(cur.id)}]`;
+    } else {
+      for (const a of ['data-testid','data-test','data-cy','data-qa','data-test-id','data-automation-id']) {
+        const v = cur.getAttribute && cur.getAttribute(a);
+        if (v && v.length <= 120 && !/^\s*$/.test(v)) { base = `//*[@${a}=${__xpathLiteral(v)}]`; break; }
+      }
+    }
+    if (base) {
+      // позиция текущего узла среди одноимённых детей своего родителя
+      const parent = el.parentElement;
+      let idx = 1, sameTagCount = 0;
+      if (parent) {
+        const kids = parent.children;
+        for (let i = 0; i < kids.length; i++) {
+          if (kids[i].tagName && kids[i].tagName.toLowerCase() === tag) {
+            sameTagCount++;
+            if (kids[i] === el) idx = sameTagCount;
+          }
+        }
+      }
+      const xp = `${base}//${tag}${(sameTagCount > 1) ? `[${idx}]` : ''}`;
+      if (isUniqueXPath(xp, el)) out.push({ sel: xp, isXPath: true });
+    }
+    cur = cur.parentElement;
+  }
+
+  // 7) Абсолютный fallback — всегда уникален
+  if (out.length === 0) {
+    const abs = buildAbsoluteXPath(el);
+    if (abs && isUniqueXPath(abs, el)) {
+      out.push({ sel: abs, isXPath: true });
+    }
+  }
+
+  // дедупликация
+  const seen = new Set();
+  return out.filter(o => !seen.has(o.sel) && (seen.add(o.sel), true));
+}
+
   
   // Функция для обнаружения похожих атрибутов
   const findSimilarAttrs = (el) => {
@@ -2856,11 +3002,13 @@ function makeDraggable(targetEl, handleEl, options = {}) {
       basicSelectors: groups.basic.slice(0, 3),      // Первые 3 без .contains и nth-child
       containsSelectors: groups.contains.slice(0, 3), // 4,5,6 с .contains
       nthSelectors: groups.nth.slice(0, 3),          // 7,8,9 с nth-child
+      xpathSelectors: (groups.xpath || []).slice(0, 3),          // 7,8,9 с nth-child
       
       // Резервные селекторы для кнопок "ещё вариантов"
       moreBasic: groups.basic.slice(3),
       moreContains: groups.contains.slice(3),
       moreNth: groups.nth.slice(3),
+      moreXPath: (groups.xpath || []).slice(3),
       
       // Дополнительные агрессивные селекторы
       aggressive: groups.aggressive
@@ -2905,7 +3053,8 @@ function makeDraggable(targetEl, handleEl, options = {}) {
     addBatch(__timeit('uniqueWithinScope', () => uniqueWithinScope(el)));
     addBatch(__timeit('nthPath', () => nthPath(el)));
 
-    // Подсчитываем "хорошие" базовые селекторы для гейтинга
+        addBatch(__timeit('byXPath', () => byXPath(el)));
+// Подсчитываем "хорошие" базовые селекторы для гейтинга
     const goodBasicCount = allSelectors.length;
     const haveEnoughBasic = goodBasicCount >= __dompickConfig.targetEnoughBasic;
 
@@ -2978,12 +3127,14 @@ function makeDraggable(targetEl, handleEl, options = {}) {
       basic: [],      // Без .contains и nth-child
       contains: [],   // С .contains
       nth: [],        // С nth-child
+      xpath: [],      // XPath
       aggressive: []  // Агрессивные fallback
     };
     
     for (const selector of selectors) {
       const sel = selector.sel;
       
+            if (selector.isXPath) { groups.xpath.push(selector); continue; }
       // contains → contains
       if (sel.includes('cy.contains') || sel.includes('.contains(')) {
         groups.contains.push(selector);
@@ -3018,6 +3169,7 @@ function makeDraggable(targetEl, handleEl, options = {}) {
     groups.basic.sort(sortByQuality);
     groups.contains.sort(sortByQuality);
     groups.nth.sort(sortByQuality);
+    groups.xpath.sort(sortByQuality);
     groups.aggressive.sort(sortByQuality);
     
     return groups;
@@ -3820,11 +3972,11 @@ function makeDraggable(targetEl, handleEl, options = {}) {
         const availableActions = getAvailableActions(el);
         const cachedGroups = __dompickSelectorCache[__dompickMode] || __dompickSelectorCache.cypress; // fallback
 
-        createSelectorGroup(groupsContainer, 'Базовые селекторы', cachedGroups.basicSelectors, cachedGroups.moreBasic, availableActions, 'basic');
+        createSelectorGroup(groupsContainer, 'Базовые селекторы CSS', cachedGroups.basicSelectors, cachedGroups.moreBasic, availableActions, 'basic');
         const containsTitle = (__dompickMode === 'js') ? 'Селекторы по тексту' : 'Селекторы с .contains';
         createSelectorGroup(groupsContainer, containsTitle, cachedGroups.containsSelectors, cachedGroups.moreContains, availableActions, 'contains');
         createSelectorGroup(groupsContainer, 'Позиционные селекторы', cachedGroups.nthSelectors, cachedGroups.moreNth, availableActions, 'nth');
-
+        createSelectorGroup(groupsContainer, 'XPath селекторы', cachedGroups.xpathSelectors || [], cachedGroups.moreXPath || [], availableActions, 'xpath');
         if (cachedGroups.aggressive && cachedGroups.aggressive.length > 0) {
           createSelectorGroup(groupsContainer, 'Агрессивные селекторы', cachedGroups.aggressive.slice(0, 5), cachedGroups.aggressive.slice(5), availableActions, 'aggressive');
         }
@@ -3898,10 +4050,11 @@ function makeDraggable(targetEl, handleEl, options = {}) {
       const loading = groupsContainer.querySelector('#__dompick-loading');
       if (loading) loading.remove();
 
-      createSelectorGroup(groupsContainer, 'Базовые селекторы', groups.basicSelectors, groups.moreBasic, availableActions, 'basic');
+      createSelectorGroup(groupsContainer, 'Базовые селекторы CSS', groups.basicSelectors, groups.moreBasic, availableActions, 'basic');
       const containsTitle = (__dompickMode === 'js') ? 'Селекторы по тексту' : 'Селекторы с .contains';
       createSelectorGroup(groupsContainer, containsTitle, groups.containsSelectors, groups.moreContains, availableActions, 'contains');
       createSelectorGroup(groupsContainer, 'Позиционные селекторы', groups.nthSelectors, groups.moreNth, availableActions, 'nth');
+      createSelectorGroup(groupsContainer, 'XPath селекторы', groups.xpathSelectors || [], groups.moreXPath || [], availableActions, 'xpath');
 
       // Если есть агрессивные — тоже показываем
       if (groups.aggressive && groups.aggressive.length > 0) {
@@ -3909,7 +4062,7 @@ function makeDraggable(targetEl, handleEl, options = {}) {
       }
 
       // ГАРАНТИЯ: если ни одного селектора не сгенерировалось — формируем абсолютный CSS‑путь
-      const totalCount = groups.basicSelectors.length + groups.containsSelectors.length + groups.nthSelectors.length + (groups.aggressive?.length || 0);
+      const totalCount = groups.basicSelectors.length + groups.containsSelectors.length + groups.nthSelectors.length + (groups.xpathSelectors?.length || 0) + (groups.aggressive?.length || 0);
       if (totalCount === 0) {
         const absPath = buildAbsoluteCssPath(el);
         const fallback = [{ sel: absPath }];
@@ -4152,20 +4305,22 @@ function makeDraggable(targetEl, handleEl, options = {}) {
     selectorRow.style.marginBottom = '8px';
     
     const buildBaseForMode = () => {
+      // ✅ XPath: показываем корректные выражения для текущего режима
+      if (selector.isXPath) {
+        if (__dompickMode === 'js') {
+          return `document.evaluate(${JSON.stringify(selector.sel)}, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue`;
+        } else {
+          // Для Cypress c плагином cypress-xpath
+          return `cy.xpath(${JSON.stringify(selector.sel)})`;
+        }
+      }
+
       if (__dompickMode === 'js') {
-        if (selector.isCypress) {
-          return convertCypressToJsBase(selector.sel);
-        }
-        // Если селектор помечен как готовое JS-выражение, возвращаем как есть
-        if (selector.isJs) {
-          return selector.sel;
-        }
+        if (selector.isCypress) return convertCypressToJsBase(selector.sel);
+        if (selector.isJs) return selector.sel;
         return `document.querySelector('${selector.sel}')`;
       } else {
-        if (selector.isCypress) {
-          return selector.sel;
-        }
-        // Если это JS селектор, конвертируем в Cypress
+        if (selector.isCypress) return selector.sel;
         if (selector.isJs || selector.sel.includes('document.querySelector') || selector.sel.includes('Array.from')) {
           return convertJsToCypressBase(selector.sel);
         }
