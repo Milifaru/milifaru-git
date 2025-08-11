@@ -2,6 +2,143 @@
   if (window.__domPickerActive) { console.warn('DOM Picker уже активен'); return; }
   window.__domPickerActive = true;
 
+  // === DEBUG/PROFILING CONFIG ===
+  // Включение: window.__dompickDebug = true; (до инъекции скрипта)
+  // Дополнительно: window.__dompickDebugLevel = 'trace' | 'info'
+  // Порог медленной сборки/запроса можно переопределить глобалями ниже.
+
+  window.__dompickDebug = false;
+  // window.__dompickDebugLevel = 'trace';
+
+  const __dompickConfig = (() => {
+    try {
+      const fromLS = (k) => (typeof localStorage !== 'undefined' && localStorage.getItem(k)) || null;
+      return {
+        debug: !!(window.__dompickDebug ?? (fromLS('__dompickDebug') === '1')),
+        logLevel: String(window.__dompickDebugLevel || 'info'),
+        buildBudgetMs: Number(window.__dompickBudgetMs || 5000),
+        slowBuildThresholdMs: Number(window.__dompickSlowBuildThresholdMs || 2000),
+        slowQueryThresholdMs: Number(window.__dompickSlowQueryThresholdMs || 30),
+        // Новые параметры для гейтинга стратегий
+        textSearchEnabled: !!(window.__dompickTextSearchEnabled ?? false),
+        aggressiveEnabled: !!(window.__dompickAggressiveEnabled ?? true),
+        strategyBudgetMs: Number(window.__dompickStrategyBudgetMs || 150),
+        targetEnoughBasic: Number(window.__dompickTargetEnoughBasic || 3),
+        maxDescendantsForTextSearch: Number(window.__dompickMaxDescendantsForTextSearch || 400),
+        domSizeSoftCap: Number(window.__dompickDomSizeSoftCap || 4000),
+      };
+    } catch (_) {
+      return { 
+        debug: false, logLevel: 'info', buildBudgetMs: 5000, slowBuildThresholdMs: 2000, slowQueryThresholdMs: 30,
+        textSearchEnabled: false, aggressiveEnabled: true, strategyBudgetMs: 150, targetEnoughBasic: 3,
+        maxDescendantsForTextSearch: 400, domSizeSoftCap: 4000
+      };
+    }
+  })();
+
+  // Простые утилиты логирования
+  const __perfStats = {
+    buildRuns: [],                           // {ctx, ms, basic, contains, nth, aggressive}
+    strategies: Object.create(null),         // {name: [ms, ...]}
+    isUnique: [],                            // {sel, ms, count, cached}
+    misc: { getAllTexts: [], findStableScope: [] }, // [ms,...]
+    totals: { isUniqueCalls: 0, isUniqueMisses: 0, isUniqueHits: 0, qsaTimeMs: 0 }
+  };
+  function __dlog(level, ...args) {
+    if (!__dompickConfig.debug) return;
+    const ok = __dompickConfig.logLevel === 'trace' || level !== 'trace';
+    if (ok) console.log('[DOMPick]', ...args);
+  }
+  function __timeit(name, fn) {
+    const t0 = performance.now();
+    const res = fn();
+    const dt = performance.now() - t0;
+    if (__dompickConfig.debug) {
+      (__perfStats.strategies[name] || (__perfStats.strategies[name] = [])).push(dt);
+      if (dt > __dompickConfig.slowQueryThresholdMs) {
+        __dlog('info', `⚠️ медленная стратегия ${name}: ${dt.toFixed(1)}ms`);
+      }
+    }
+    return res;
+  }
+  function __dumpPerfSummary(ctx, groups) {
+    if (!__dompickConfig.debug) return;
+    const lastRun = __perfStats.buildRuns[__perfStats.buildRuns.length - 1];
+    console.groupCollapsed(`🧪 DOMPick Perf (${ctx}) · ${lastRun?.ms?.toFixed?.(1)}ms`);
+    if (groups) {
+      console.log('Counts:', {
+        basic: groups.basicSelectors?.length, contains: groups.containsSelectors?.length,
+        nth: groups.nthSelectors?.length, aggressive: (groups.aggressive?.length || 0)
+      });
+    }
+    console.log('isUnique:', __perfStats.totals, 'samples:', __perfStats.isUnique.length);
+    const stratAvg = Object.fromEntries(Object.entries(__perfStats.strategies).map(([k, arr]) => {
+      const sum = arr.reduce((a,b)=>a+b,0); return [k, { calls: arr.length, avgMs: +(sum/arr.length).toFixed(2), sumMs: +sum.toFixed(1) }];
+    }));
+    console.table(stratAvg);
+    if (__perfStats.isUnique.length) {
+      console.table(__perfStats.isUnique.slice(0, 20));
+    }
+    console.groupEnd();
+  }
+
+  // Утилиты для гейтинга стратегий
+  function __canRun(name, weight = 1) {
+    if (budgetExpired()) {
+      __dlog('info', `⏰ ${name}: пропуск (бюджет истёк)`);
+      return false;
+    }
+    const remaining = __buildBudgetEnd - performance.now();
+    if (remaining < __dompickConfig.strategyBudgetMs * weight) {
+      __dlog('info', `⏰ ${name}: пропуск (остаток ${remaining.toFixed(0)}ms < ${__dompickConfig.strategyBudgetMs * weight}ms)`);
+      return false;
+    }
+    return true;
+  }
+
+  function __countDescendants(el, cap = 5000) {
+    let count = 0;
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_ELEMENT, null, false);
+    while (walker.nextNode() && count < cap) count++;
+    return count;
+  }
+
+  // --- безопасная установка HTML на страницах с Trusted Types ---
+  const setTrustedHTML = (() => {
+    let policy = null;
+
+    // 1) Если доступен Sanitizer API — используем его
+    const canSanitize = typeof Element.prototype.setHTML === 'function' && 'Sanitizer' in window;
+
+    // 2) Пытаемся создать TT-политику (имя 'default' часто разрешено; fallback — своё имя)
+    if (window.trustedTypes) {
+      try { policy = trustedTypes.createPolicy('default', { createHTML: s => s }); } catch {}
+      if (!policy) {
+        try { policy = trustedTypes.createPolicy('dompick', { createHTML: s => s }); } catch {}
+      }
+    }
+
+    return (el, html) => {
+      // a) Через Sanitizer API
+      if (canSanitize) {
+        try { el.setHTML(html, { sanitizer: new Sanitizer() }); return; } catch {}
+      }
+      // b) Через Trusted Types (если политику дали создать)
+      if (policy) {
+        el.innerHTML = policy.createHTML(html);
+        return;
+      }
+      // c) Фолбэк: парсим строку и вставляем готовые узлы (без innerHTML)
+      while (el.firstChild) el.removeChild(el.firstChild);
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const frag = document.createDocumentFragment();
+      for (const node of Array.from(doc.body.childNodes)) frag.appendChild(node);
+      el.appendChild(frag);
+    };
+  })();
+
+  const clearNode = (el) => { while (el.firstChild) el.removeChild(el.firstChild); };
+
   // ==== УТИЛИТА ДЛЯ ПЕРЕТАСКИВАНИЯ (всегда целиком во вьюпорте) ====
 /**
  * Делает элемент перетаскиваемым с прилипаниями к краям и гарантией полной видимости.
@@ -826,7 +963,7 @@ function makeDraggable(targetEl, handleEl, options = {}) {
   // ==== Панель ====
   const panel = document.createElement('div');
   panel.className = '__dompick-panel __dompick-theme-transition';
-  panel.innerHTML = `
+  setTrustedHTML(panel, `
     <div style="display: flex; justify-content: space-between; align-items: flex-start; width: 100%;">
       <div style="flex: 1;">
         <div style="font-weight: bold; margin-bottom: 4px; color: var(--dompick-text-primary);">
@@ -850,7 +987,7 @@ function makeDraggable(targetEl, handleEl, options = {}) {
         <button class="__dompick-btn-close" id="__dompick-close">Закрыть</button>
       </div>
     </div>
-  `;
+  `);
   document.body.appendChild(panel);
 
   // ==== Функции подсветки ====
@@ -925,9 +1062,9 @@ function makeDraggable(targetEl, handleEl, options = {}) {
     
     // НЕТ зафиксированного элемента → просим выбрать
     if (!__dompickCachedElement) {
-      groupsContainer.innerHTML = '<div style="opacity:.8;font-size:12px;color:var(--dompick-text-secondary)">' +
+      setTrustedHTML(groupsContainer, '<div style="opacity:.8;font-size:12px;color:var(--dompick-text-secondary)">' +
         'Сначала выберите элемент (Ctrl+клик).' +
-        '</div>';
+        '</div>');
       return;
     }
     
@@ -940,7 +1077,7 @@ function makeDraggable(targetEl, handleEl, options = {}) {
     // Если есть кэш для текущего режима, используем его
     if (__dompickSelectorCache && __dompickCachedElement && __dompickSelectorCache[__dompickMode]) {
       // Очищаем содержимое
-      groupsContainer.innerHTML = '';
+      clearNode(groupsContainer);
       
       const availableActions = getAvailableActions(__dompickCachedElement);
       const cachedGroups = __dompickSelectorCache[__dompickMode];
@@ -957,15 +1094,26 @@ function makeDraggable(targetEl, handleEl, options = {}) {
     }
     
     // Если кэша нет, показываем состояние загрузки и генерируем селекторы синхронно
-    groupsContainer.innerHTML = '<div id="__dompick-loading" style="opacity:.8;font-size:12px;color:var(--dompick-text-secondary)">Генерация селекторов...</div>';
+    setTrustedHTML(groupsContainer, '<div id="__dompick-loading" style="opacity:.8;font-size:12px;color:var(--dompick-text-secondary)">Генерация селекторов...</div>');
     
     // Небольшая задержка чтобы пользователь увидел сообщение о загрузке
     setTimeout(() => {
       // Генерируем селекторы для текущего режима синхронно
       resetPerfGuards();
-      __buildBudgetEnd = performance.now() + 5000;
+      const __buildStart = performance.now();
+      __buildBudgetEnd = __buildStart + (__dompickConfig.buildBudgetMs || 5000);
       
       const groups = buildCandidates(__dompickCachedElement);
+      const __buildMs = performance.now() - __buildStart;
+      if (__dompickConfig.debug) {
+        __perfStats.buildRuns.push({ ctx: 'modalSync', ms: __buildMs, 
+          basic: groups.basicSelectors.length, contains: groups.containsSelectors.length,
+          nth: groups.nthSelectors.length, aggressive: (groups.aggressive?.length || 0)
+        });
+        if (__buildMs > __dompickConfig.slowBuildThresholdMs) {
+          __dlog('info', `⏱️ генерация заняла ${__buildMs.toFixed(1)}ms (>${__dompickConfig.slowBuildThresholdMs}ms)`);
+        }
+      }
       
       // Инициализируем кэш если его нет
       if (!__dompickSelectorCache) {
@@ -999,6 +1147,7 @@ function makeDraggable(targetEl, handleEl, options = {}) {
       }
       
       resetPerfGuards();
+      __dumpPerfSummary('modalAsync', groups);
     }, 200); // Небольшая задержка для обновления UI
   };
 
@@ -1409,16 +1558,40 @@ function makeDraggable(targetEl, handleEl, options = {}) {
   let __buildBudgetEnd = 0; // timestamp (performance.now) когда прекращаем дорогие операции
   const __queryCache = new Map(); // selector -> Array<Element>
   const budgetExpired = () => __buildBudgetEnd > 0 && performance.now() > __buildBudgetEnd;
-  const resetPerfGuards = () => { __buildBudgetEnd = 0; __queryCache.clear(); };
+  const resetPerfGuards = () => {
+    __buildBudgetEnd = 0;
+    __queryCache.clear();
+    // сброс профайла между запусками генерации
+    if (__dompickConfig.debug) {
+      __perfStats.strategies = Object.create(null);
+      __perfStats.isUnique.length = 0;
+      __perfStats.misc.getAllTexts.length = 0;
+      __perfStats.misc.findStableScope.length = 0;
+      __perfStats.totals = { isUniqueCalls: 0, isUniqueMisses: 0, isUniqueHits: 0, qsaTimeMs: 0 };
+    }
+  };
 
-  const isUnique = (selector, el) => {
+  const isUnique = (selector, el) => { // :contentReference[oaicite:5]{index=5}
     try {
       let list = __queryCache.get(selector);
       if (!list) {
         // Кэшируем результаты querySelectorAll для повтора в рамках одной генерации
+        const t0 = performance.now();
         list = Array.from(document.querySelectorAll(selector));
+        const dt = performance.now() - t0;
+        if (__dompickConfig.debug) {
+          __perfStats.totals.isUniqueMisses++;
+          __perfStats.totals.qsaTimeMs += dt;
+          if (dt > __dompickConfig.slowQueryThresholdMs) {
+            __perfStats.isUnique.push({ sel: selector, ms: +dt.toFixed(1), count: list.length, cached: false });
+          }
+        }
         __queryCache.set(selector, list);
+      } else if (__dompickConfig.debug) {
+        __perfStats.totals.isUniqueHits++;
+        __perfStats.isUnique.push({ sel: selector, ms: 0, count: list.length, cached: true });
       }
+      if (__dompickConfig.debug) __perfStats.totals.isUniqueCalls++;
       return list.length === 1 && list[0] === el;
     } catch { return false; }
   };
@@ -1457,7 +1630,8 @@ function makeDraggable(targetEl, handleEl, options = {}) {
   };
 
   // Находит ближайший стабильный предок и его уникальный селектор без цифр
-  function findStableScope(el) {
+  function findStableScope(el) { // может быть дорогим на глубоком DOM
+    const t0 = performance.now();
     let current = el.parentElement;
     let depth = 0;
     while (current && depth < 10) {
@@ -1465,6 +1639,8 @@ function makeDraggable(targetEl, handleEl, options = {}) {
       if (current.id && !hasDigits(current.id)) {
         const sel = `#${esc(current.id)}`;
         if (document.querySelectorAll(sel).length === 1) {
+          const dt = performance.now() - t0;
+          if (__dompickConfig.debug) __perfStats.misc.findStableScope.push(dt);
           return { scopeEl: current, scopeSelector: sel };
         }
       }
@@ -1475,6 +1651,8 @@ function makeDraggable(targetEl, handleEl, options = {}) {
         if (!v || hasDigits(v)) continue;
         const sel = `[${a}="${esc(v)}"]`;
         if (document.querySelectorAll(sel).length === 1) {
+          const dt = performance.now() - t0;
+          if (__dompickConfig.debug) __perfStats.misc.findStableScope.push(dt);
           return { scopeEl: current, scopeSelector: sel };
         }
       }
@@ -1485,6 +1663,8 @@ function makeDraggable(targetEl, handleEl, options = {}) {
         for (const cls of stable.slice(0, 2)) {
           const sel = `.${esc(cls)}`;
           if (document.querySelectorAll(sel).length === 1) {
+            const dt = performance.now() - t0;
+            if (__dompickConfig.debug) __perfStats.misc.findStableScope.push(dt);
             return { scopeEl: current, scopeSelector: sel };
           }
         }
@@ -1493,6 +1673,8 @@ function makeDraggable(targetEl, handleEl, options = {}) {
       current = current.parentElement;
       depth++;
     }
+    const dt = performance.now() - t0;
+    if (__dompickConfig.debug) __perfStats.misc.findStableScope.push(dt);
     return null;
   }
 
@@ -1514,9 +1696,9 @@ function makeDraggable(targetEl, handleEl, options = {}) {
   }
 
   // Генерирует селекторы: стабильный предок (без цифр) + минимальный позиционный путь до элемента
-  function byStableScopePath(el) {
+  function byStableScopePath(el) { // :contentReference[oaicite:6]{index=6}
     const out = [];
-    const found = findStableScope(el);
+    const found = __timeit('findStableScope', () => findStableScope(el));
     if (!found) return out;
     const { scopeEl, scopeSelector } = found;
     const path = buildMinimalPathFromAncestor(el, scopeEl);
@@ -1586,7 +1768,8 @@ function makeDraggable(targetEl, handleEl, options = {}) {
   };
 
   // Функция для получения всех возможных текстов из элемента и его детей
-  const getAllTexts = (el) => {
+  const getAllTexts = (el) => { // возможный «тяжёлый» обход дочерних элементов
+    const t0_all = performance.now();
     const texts = [];
     
     // Если есть исходный элемент с текстом, приоритизируем его
@@ -1600,7 +1783,12 @@ function makeDraggable(targetEl, handleEl, options = {}) {
     if (mainText) texts.push(mainText);
     
     // Тексты из дочерних элементов (для случаев как <span>Комментарии</span>)
+    const t0 = performance.now();
     const children = el.querySelectorAll('*');
+    const dt = performance.now() - t0;
+    if (__dompickConfig.debug) {
+      __perfStats.misc.getAllTexts.push(dt);
+    }
     for (const child of children) {
       const childText = getElementText(child);
       if (childText && childText !== mainText && childText.length >= 2) {
@@ -1612,6 +1800,10 @@ function makeDraggable(targetEl, handleEl, options = {}) {
     const uniqueTexts = [...new Set(texts)];
     const originalText = el._originalTextElement ? getElementText(el._originalTextElement) : null;
     
+    if (__dompickConfig.debug) {
+      const dtAll = performance.now() - t0_all;
+      if (dtAll > __dompickConfig.slowQueryThresholdMs) __dlog('trace', `getAllTexts: ${dtAll.toFixed(1)}ms`);
+    }
     if (originalText && uniqueTexts.includes(originalText)) {
       // Ставим исходный текст первым
       return [originalText, ...uniqueTexts.filter(t => t !== originalText).sort((a, b) => a.length - b.length)];
@@ -2676,7 +2868,7 @@ function makeDraggable(targetEl, handleEl, options = {}) {
   }
 
   // Собираем все возможные селекторы
-  function collectAllSelectors(el) {
+  function collectAllSelectors(el) { // :contentReference[oaicite:7]{index=7}
     const allSelectors = [];
     const candidatesMap = new Map();
 
@@ -2702,24 +2894,44 @@ function makeDraggable(targetEl, handleEl, options = {}) {
 
     // 1) Самые быстрые стратегии
     // Сначала стратегии без цифр (score уже понижен внутри)
-    addBatch(byStableScopePath(el));
-    addBatch(byClassCombos(el));
-    addBatch(byAttr(el));
-    addBatch(byPreferredData(el));
-    addBatch(byId(el));
+    addBatch(__timeit('byStableScopePath', () => byStableScopePath(el)));
+    addBatch(__timeit('byClassCombos', () => byClassCombos(el)));
+    addBatch(__timeit('byAttr', () => byAttr(el)));
+    addBatch(__timeit('byPreferredData', () => byPreferredData(el)));
+    addBatch(__timeit('byId', () => byId(el)));
 
     // 2) Остальные базовые
-    addBatch(byAnyData(el));
-    addBatch(uniqueWithinScope(el));
-    addBatch(nthPath(el));
+    addBatch(__timeit('byAnyData', () => byAnyData(el)));
+    addBatch(__timeit('uniqueWithinScope', () => uniqueWithinScope(el)));
+    addBatch(__timeit('nthPath', () => nthPath(el)));
 
-    // 3) Текстовые (дорогие) — после базовых
-    if (!budgetExpired()) addBatch(byCypressText(el));
-    if (!budgetExpired()) addBatch(byCypressCombo(el));
+    // Подсчитываем "хорошие" базовые селекторы для гейтинга
+    const goodBasicCount = allSelectors.length;
+    const haveEnoughBasic = goodBasicCount >= __dompickConfig.targetEnoughBasic;
+
+    // 3) Текстовые (дорогие) — гейтим по количеству базовых и размеру DOM
+    if (__dompickConfig.textSearchEnabled && !haveEnoughBasic) {
+      const descendants = __countDescendants(el, __dompickConfig.maxDescendantsForTextSearch + 1);
+      if (descendants <= __dompickConfig.maxDescendantsForTextSearch) {
+        if (__canRun('byCypressText', 2)) {
+          addBatch(__timeit('byCypressText', () => byCypressText(el)));
+        }
+        if (__canRun('byCypressCombo', 2)) {
+          addBatch(__timeit('byCypressCombo', () => byCypressCombo(el)));
+        }
+      } else {
+        __dlog('info', `📝 текстовые стратегии: пропуск (${descendants} потомков > ${__dompickConfig.maxDescendantsForTextSearch})`);
+      }
+    } else if (!__dompickConfig.textSearchEnabled) {
+      __dlog('info', '📝 текстовые стратегии: отключены глобально');
+    } else {
+      __dlog('info', `📝 текстовые стратегии: пропуск (достаточно базовых: ${goodBasicCount} >= ${__dompickConfig.targetEnoughBasic})`);
+    }
+
     // Явный короткий текстовый селектор внутри стабильного scope
-    const scope = findStableScope(el);
+    const scope = __timeit('findStableScope(in-collect)', () => findStableScope(el));
     if (scope) {
-      const texts = getAllTexts(el).filter(t => isGoodTextForContains(t));
+      const texts = __timeit('getAllTexts(scope-short)', () => getAllTexts(el)).filter(t => isGoodTextForContains(t));
       const shortText = texts.find(t => t.length <= 25);
       if (shortText) {
         if (__dompickMode === 'js') {
@@ -2733,14 +2945,29 @@ function makeDraggable(targetEl, handleEl, options = {}) {
     }
 
     // 4) Позиционные
-    if (!budgetExpired()) addBatch(byNthChild(el));
-    if (!budgetExpired()) addBatch(byParentWithNth(el));
-    if (!budgetExpired()) addBatch(bySiblingSelectors(el));
-    if (!budgetExpired()) addBatch(byCalendarSelectors(el));
+    if (!budgetExpired()) addBatch(__timeit('byNthChild', () => byNthChild(el)));
+    if (!budgetExpired()) addBatch(__timeit('byParentWithNth', () => byParentWithNth(el)));
+    if (!budgetExpired()) addBatch(__timeit('bySiblingSelectors', () => bySiblingSelectors(el)));
+    if (!budgetExpired()) addBatch(__timeit('byCalendarSelectors', () => byCalendarSelectors(el)));
 
-    // 5) Агрессивные — включаем всегда (с приоритетом ниже)
-    if (!budgetExpired()) addBatch(generateAggressiveFallbacks(el));
-    if (!budgetExpired()) addBatch(generateSuperAggressiveFallbacks(el));
+    // 5) Агрессивные — гейтим по размеру DOM и количеству базовых
+    if (__dompickConfig.aggressiveEnabled && !haveEnoughBasic) {
+      const totalDescendants = __countDescendants(document.body, __dompickConfig.domSizeSoftCap + 1);
+      if (totalDescendants <= __dompickConfig.domSizeSoftCap) {
+        if (__canRun('generateAggressiveFallbacks', 3)) {
+          addBatch(__timeit('generateAggressiveFallbacks', () => generateAggressiveFallbacks(el)));
+        }
+        if (__canRun('generateSuperAggressiveFallbacks', 4)) {
+          addBatch(__timeit('generateSuperAggressiveFallbacks', () => generateSuperAggressiveFallbacks(el)));
+        }
+      } else {
+        __dlog('info', `🔥 агрессивные стратегии: пропуск (DOM слишком большой: ${totalDescendants} > ${__dompickConfig.domSizeSoftCap})`);
+      }
+    } else if (!__dompickConfig.aggressiveEnabled) {
+      __dlog('info', '🔥 агрессивные стратегии: отключены глобально');
+    } else {
+      __dlog('info', `🔥 агрессивные стратегии: пропуск (достаточно базовых: ${goodBasicCount} >= ${__dompickConfig.targetEnoughBasic})`);
+    }
 
     return allSelectors;
   }
@@ -3557,7 +3784,7 @@ function makeDraggable(targetEl, handleEl, options = {}) {
       // Используем кэшированные селекторы
       const modal = document.createElement('div');
       modal.className = '__dompick-modal';
-      modal.innerHTML = `
+      setTrustedHTML(modal, `
         <div class="__dompick-backdrop"></div>
         <div class="__dompick-dialog __dompick-theme-transition">
           <div class="__dompick-head">
@@ -3570,7 +3797,7 @@ function makeDraggable(targetEl, handleEl, options = {}) {
             </div>
           </div>
         </div>
-      `;
+      `);
       document.body.appendChild(modal);
 
       const groupsContainer = modal.querySelector('.__dompick-groups');
@@ -3608,7 +3835,7 @@ function makeDraggable(targetEl, handleEl, options = {}) {
     // Открываем модалку СРАЗУ, а тяжёлую генерацию переносим на idle/next-tick
     const modal = document.createElement('div');
     modal.className = '__dompick-modal';
-    modal.innerHTML = `
+    setTrustedHTML(modal, `
       <div class="__dompick-backdrop"></div>
       <div class="__dompick-dialog __dompick-theme-transition">
         <div class="__dompick-head">
@@ -3621,7 +3848,7 @@ function makeDraggable(targetEl, handleEl, options = {}) {
           </div>
         </div>
       </div>
-    `;
+    `);
     document.body.appendChild(modal);
 
     const groupsContainer = modal.querySelector('.__dompick-groups');
@@ -3640,13 +3867,24 @@ function makeDraggable(targetEl, handleEl, options = {}) {
     modal.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal(); });
 
     // Планируем асинхронную генерацию с тайм-бюджетом
-    const runAsync = () => {
+    const runAsync = () => { // фоновая (idle/next-tick) генерация селекторов :contentReference[oaicite:8]{index=8}
       // Устанавливаем увеличенный бюджет на генерацию и чистим кэш
       resetPerfGuards();
-      __buildBudgetEnd = performance.now() + 5000; // можно увеличить при необходимости
+      const __buildStart = performance.now();
+      __buildBudgetEnd = __buildStart + (__dompickConfig.buildBudgetMs || 5000); // можно увеличить при необходимости
       
       // Генерируем селекторы для текущего режима
       const groups = buildCandidates(el);
+      const __buildMs = performance.now() - __buildStart;
+      if (__dompickConfig.debug) {
+        __perfStats.buildRuns.push({ ctx: 'modalAsync', ms: __buildMs,
+          basic: groups.basicSelectors.length, contains: groups.containsSelectors.length,
+          nth: groups.nthSelectors.length, aggressive: (groups.aggressive?.length || 0)
+        });
+        if (__buildMs > __dompickConfig.slowBuildThresholdMs) {
+          __dlog('info', `⏱️ генерация (async) заняла ${__buildMs.toFixed(1)}ms (>${__dompickConfig.slowBuildThresholdMs}ms)`);
+        }
+      }
       
       // Инициализируем кэш
       __dompickSelectorCache = {
@@ -3677,6 +3915,9 @@ function makeDraggable(targetEl, handleEl, options = {}) {
         const fallback = [{ sel: absPath }];
         createSelectorGroup(groupsContainer, 'Агрессивные селекторы (fallback)', fallback, [], availableActions, 'aggressive');
       }
+      
+      resetPerfGuards();
+      __dumpPerfSummary('modalAsync', groups);
       
       // Убираем фоновую генерацию - селекторы для противоположного режима будут генерироваться при первом переключении
     };
@@ -3946,7 +4187,7 @@ function makeDraggable(targetEl, handleEl, options = {}) {
     codeElement.setAttribute('data-original-selector', selector.sel);
     codeElement.setAttribute('data-was-cypress', selector.isCypress ? 'true' : 'false');
     
-    selectorPart.innerHTML = `<div><b>${number}.</b> </div>`;
+    setTrustedHTML(selectorPart, `<div><b>${number}.</b> </div>`);
     selectorPart.querySelector('div').appendChild(codeElement);
     
     // Бейдж рейтинга (0..100), цвет от красного к зелёному
