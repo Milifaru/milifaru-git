@@ -2,43 +2,503 @@
   if (window.__domPickerActive) { console.warn('DOM Picker уже активен'); return; }
   window.__domPickerActive = true;
 
+  // Очистка "хвостов" от предыдущего запуска
+  document.querySelectorAll('.__dompick-modal, .__dompick-overlay').forEach(n => n.remove());
+  document.querySelectorAll('.__dompick-highlight').forEach(el => el.classList.remove('__dompick-highlight'));
+  document.body.classList.remove('__dompick-theme-js','__dompick-theme-cypress','__dompick-theme-transition');
+
   // ==== Стили ====
   const styleEl = document.createElement('style');
   styleEl.textContent = `
-    .__dompick-panel{position:fixed;right:16px;bottom:16px;z-index:2147483647;background:#111827;color:#e5e7eb;
-      font:12px/1.4 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;border:1px solid #374151;border-radius:12px;
-      box-shadow:0 10px 30px rgba(0,0,0,.35);padding:10px 12px;min-width:260px;display:flex;justify-content:space-between;align-items:center}
-    .__dompick-help{opacity:.8;margin-left:8px}
-    .__dompick-btn-close{cursor:pointer;border:1px solid #4b5563;background:#1f2937;color:#e5e7eb;border-radius:8px;padding:4px 8px}
-    .__dompick-btn-close:hover{background:#374151}
-    .__dompick-btn{cursor:pointer;border:1px solid #4b5563;background:#1f2937;color:#e5e7eb;border-radius:8px;padding:4px 8px;margin-left:4px;font-size:11px}
-    .__dompick-btn:hover{background:#374151}
-    .__dompick-highlight{outline:2px solid #ff0066; outline-offset:2px}
-    .__dompick-overlay{position:fixed;top:0;left:0;width:100vw;height:100vh;z-index:2147483646;cursor:crosshair;background:transparent}
-    .__dompick-modal{position:fixed;inset:0;z-index:2147483647;display:flex;align-items:center;justify-content:center}
-    .__dompick-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.45)}
-    .__dompick-dialog{position:relative;background:#0b1020;color:#e5e7eb;width:min(920px,95vw);max-height:85vh;
-      border:1px solid #334155;border-radius:14px;box-shadow:0 20px 50px rgba(0,0,0,.5);display:flex;flex-direction:column}
-    .__dompick-head{display:flex;align-items:center;gap:10px;justify-content:space-between;padding:12px 16px;border-bottom:1px solid #1f2937;
-      flex-shrink:0;position:sticky;top:0;background:#0b1020;z-index:10;border-radius:14px 14px 0 0}
-    .__dompick-title{font-weight:700}
-    .__dompick-body{padding:12px 16px;overflow-y:auto;flex:1}
-    .__dompick-list{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center}
-    .__dompick-buttons{display:flex;align-items:center;gap:4px}
-    .__dompick-item{background:#0f172a;border:1px solid #1f2937;border-radius:10px;padding:8px 10px;word-break:break-all}
-    .__dompick-copy{cursor:pointer;border:1px solid #475569;background:#111827;border-radius:10px;padding:6px 10px}
-    .__dompick-copy:hover{background:#1f2937}
-    .__dompick-action{cursor:pointer;border:1px solid #059669;background:#064e3b;color:#10b981;border-radius:10px;padding:6px 8px;margin-left:4px;font-size:11px}
-    .__dompick-action:hover{background:#065f46}
-    .__dompick-toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:#16a34a;color:#fff;padding:8px 12px;border-radius:999px;box-shadow:0 10px 30px rgba(0,0,0,.4);opacity:0;transition:opacity .2s}
-    .__dompick-toast.show{opacity:1}
-    .__dompick-group{border:1px solid #1f2937;border-radius:8px;padding:12px;margin-bottom:12px;background:#0f172a}
-    .__dompick-group:last-child{margin-bottom:0}
-    .__dompick-btn{cursor:pointer;border:1px solid #4b5563;background:#1f2937;color:#e5e7eb;border-radius:6px;padding:6px 12px;font-size:11px;transition:background .2s}
-    .__dompick-btn:hover{background:#374151}
-    .__dompick-selector-row{display:grid;grid-template-columns:1fr auto;gap:12px;align-items:center;margin-bottom:8px}
-    .__dompick-selector-row:last-child{margin-bottom:0}
-    /* (удалённый) toggle стили больше не используются */
+    /* CSS переменные для тем */
+    :root {
+      --dompick-bg-primary: #111827;
+      --dompick-bg-secondary: #1f2937;
+      --dompick-bg-tertiary: #0f172a;
+      --dompick-bg-dialog: #0b1020;
+      --dompick-text-primary: #e5e7eb;
+      --dompick-text-secondary: #9ca3af;
+      --dompick-border-primary: #374151;
+      --dompick-border-secondary: #4b5563;
+      --dompick-border-dialog: #334155;
+      --dompick-accent-primary: #ff0066;
+      --dompick-accent-secondary: #059669;
+      --dompick-accent-tertiary: #10b981;
+      --dompick-shadow: rgba(0,0,0,.35);
+      --dompick-shadow-dialog: rgba(0,0,0,.5);
+      --dompick-backdrop: rgba(0,0,0,.45);
+      --dompick-success: #16a34a;
+      --dompick-transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+      /* Z-index переменные для правильного порядка слоев */
+      --dompick-z-overlay: 2147483645;
+      --dompick-z-modal: 2147483646;
+      --dompick-z-top: 2147483647;
+    }
+
+         /* Тема для JS режима */
+     .__dompick-theme-js {
+       --dompick-bg-primary: #1a1a2e;
+       --dompick-bg-secondary: #16213e;
+       --dompick-bg-tertiary: #0f0f23;
+       --dompick-bg-dialog: #0a0a1a;
+       --dompick-text-primary: #d1d5db;
+       --dompick-text-secondary: #9ca3af;
+       --dompick-border-primary: #374151;
+       --dompick-border-secondary: #4b5563;
+       --dompick-border-dialog: #1f2937;
+       --dompick-accent-primary: #d97706;
+       --dompick-accent-secondary: #b45309;
+       --dompick-accent-tertiary: #f59e0b;
+       --dompick-shadow: rgba(0, 0, 0, 0.3);
+       --dompick-shadow-dialog: rgba(0, 0, 0, 0.4);
+       --dompick-backdrop: rgba(0, 0, 0, 0.4);
+       --dompick-success: #047857;
+     }
+
+     /* Тема для Cypress режима */
+     .__dompick-theme-cypress {
+       --dompick-bg-primary: #0f172a;
+       --dompick-bg-secondary: #1e293b;
+       --dompick-bg-tertiary: #020617;
+       --dompick-bg-dialog: #0a0f1a;
+       --dompick-text-primary: #e2e8f0;
+       --dompick-text-secondary: #94a3b8;
+       --dompick-border-primary: #334155;
+       --dompick-border-secondary: #475569;
+       --dompick-border-dialog: #1e293b;
+       --dompick-accent-primary: #0891b2;
+       --dompick-accent-secondary: #0e7490;
+       --dompick-accent-tertiary: #06b6d4;
+       --dompick-shadow: rgba(0, 0, 0, 0.3);
+       --dompick-shadow-dialog: rgba(0, 0, 0, 0.4);
+       --dompick-backdrop: rgba(0, 0, 0, 0.4);
+       --dompick-success: #059669;
+     }
+
+    /* Основные стили с использованием CSS переменных */
+    .__dompick-panel {
+      position: fixed;
+      right: 16px;
+      bottom: 16px;
+      z-index: 2147483647;
+      background: var(--dompick-bg-primary);
+      color: var(--dompick-text-primary);
+      font: 12px/1.4 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      border: 1px solid var(--dompick-border-primary);
+      border-radius: 12px;
+      box-shadow: 0 10px 30px var(--dompick-shadow);
+      padding: 10px 12px;
+      min-width: 260px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      transition: var(--dompick-transition);
+    }
+
+    .__dompick-help {
+      opacity: .8;
+      margin-left: 8px;
+      color: var(--dompick-text-secondary);
+    }
+
+    .__dompick-btn-close {
+      cursor: pointer;
+      border: 1px solid var(--dompick-border-secondary);
+      background: var(--dompick-bg-secondary);
+      color: var(--dompick-text-primary);
+      border-radius: 8px;
+      padding: 4px 8px;
+      transition: var(--dompick-transition);
+    }
+
+    .__dompick-btn-close:hover {
+      background: var(--dompick-border-primary);
+      transform: translateY(-1px);
+    }
+
+    .__dompick-btn {
+      cursor: pointer;
+      border: 1px solid var(--dompick-border-secondary);
+      background: var(--dompick-bg-secondary);
+      color: var(--dompick-text-primary);
+      border-radius: 8px;
+      padding: 4px 8px;
+      margin-left: 4px;
+      font-size: 11px;
+      transition: var(--dompick-transition);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .__dompick-btn:hover {
+      background: var(--dompick-border-primary);
+      transform: translateY(-1px);
+    }
+
+    .__dompick-btn::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: -100%;
+      width: 100%;
+      height: 100%;
+      background: linear-gradient(90deg, transparent, rgba(255,255,255,0.1), transparent);
+      transition: left 0.5s;
+    }
+
+    .__dompick-btn:hover::before {
+      left: 100%;
+    }
+
+    .__dompick-highlight {
+      outline: 2px solid var(--dompick-accent-primary);
+      outline-offset: 2px;
+      animation: __dompick-pulse 2s infinite;
+    }
+
+    @keyframes __dompick-pulse {
+      0%, 100% { outline-color: var(--dompick-accent-primary); }
+      50% { outline-color: var(--dompick-accent-secondary); }
+    }
+
+    .__dompick-overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      z-index: var(--dompick-z-overlay);
+      cursor: crosshair;
+      background: transparent;
+    }
+
+    .__dompick-modal {
+      position: fixed;
+      inset: 0;
+      z-index: var(--dompick-z-modal);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .__dompick-backdrop {
+      position: absolute;
+      inset: 0;
+      background: var(--dompick-backdrop);
+      backdrop-filter: blur(4px);
+      transition: var(--dompick-transition);
+    }
+
+    .__dompick-dialog {
+      position: relative;
+      background: var(--dompick-bg-dialog);
+      color: var(--dompick-text-primary);
+      width: min(920px,95vw);
+      max-height: 85vh;
+      border: 1px solid var(--dompick-border-dialog);
+      border-radius: 14px;
+      box-shadow: 0 20px 50px var(--dompick-shadow-dialog);
+      display: flex;
+      flex-direction: column;
+      transition: var(--dompick-transition);
+      transform: scale(0.95);
+      opacity: 0;
+      animation: __dompick-dialog-enter 0.3s ease-out forwards;
+    }
+
+    @keyframes __dompick-dialog-enter {
+      to {
+        transform: scale(1);
+        opacity: 1;
+      }
+    }
+
+    .__dompick-head {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      justify-content: space-between;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--dompick-border-primary);
+      flex-shrink: 0;
+      position: sticky;
+      top: 0;
+      background: var(--dompick-bg-dialog);
+      z-index: 10;
+      border-radius: 14px 14px 0 0;
+    }
+
+    .__dompick-title {
+      font-weight: 700;
+      color: var(--dompick-accent-tertiary);
+      text-shadow: 0 0 8px var(--dompick-accent-primary);
+    }
+
+    .__dompick-body {
+      padding: 12px 16px;
+      overflow-y: auto;
+      flex: 1;
+    }
+
+    .__dompick-list {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      align-items: center;
+    }
+
+    .__dompick-buttons {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .__dompick-item {
+      background: var(--dompick-bg-tertiary);
+      border: 1px solid var(--dompick-border-primary);
+      border-radius: 10px;
+      padding: 8px 10px;
+      word-break: break-all;
+      transition: var(--dompick-transition);
+    }
+
+    .__dompick-item:hover {
+      border-color: var(--dompick-accent-primary);
+      box-shadow: 0 0 0 1px var(--dompick-accent-primary);
+    }
+
+    .__dompick-copy {
+      cursor: pointer;
+      border: 1px solid var(--dompick-border-secondary);
+      background: var(--dompick-bg-secondary);
+      color: var(--dompick-text-primary);
+      border-radius: 10px;
+      padding: 6px 10px;
+      transition: var(--dompick-transition);
+    }
+
+    .__dompick-copy:hover {
+      background: var(--dompick-border-primary);
+      transform: translateY(-1px);
+    }
+
+    .__dompick-action {
+      cursor: pointer;
+      border: 1px solid var(--dompick-accent-secondary);
+      background: var(--dompick-accent-secondary);
+      color: var(--dompick-accent-tertiary);
+      border-radius: 10px;
+      padding: 6px 8px;
+      margin-left: 4px;
+      font-size: 11px;
+      transition: var(--dompick-transition);
+    }
+
+    .__dompick-action:hover {
+      background: var(--dompick-accent-primary);
+      transform: translateY(-1px);
+    }
+
+             .__dompick-toast {
+      position: fixed;
+      left: 50%;
+      bottom: 24px;
+      transform: translateX(-50%);
+      background: var(--dompick-accent-secondary);
+      color: var(--dompick-accent-tertiary);
+      padding: 8px 12px;
+      border-radius: 999px;
+      box-shadow: 0 10px 30px var(--dompick-shadow);
+      border: 1px solid var(--dompick-accent-primary);
+      opacity: 0;
+      transition: var(--dompick-transition);
+      z-index: var(--dompick-z-top);
+      pointer-events: none;
+      font-weight: 500;
+    }
+
+    .__dompick-toast.show {
+      opacity: 1;
+      transform: translateX(-50%) translateY(-4px);
+    }
+
+    .__dompick-group {
+      border: 1px solid var(--dompick-border-primary);
+      border-radius: 8px;
+      padding: 12px;
+      margin-bottom: 12px;
+      background: var(--dompick-bg-tertiary);
+      transition: var(--dompick-transition);
+    }
+
+    .__dompick-group:last-child {
+      margin-bottom: 0;
+    }
+
+    .__dompick-group:hover {
+      border-color: var(--dompick-accent-primary);
+      box-shadow: 0 0 0 1px var(--dompick-accent-primary);
+    }
+
+    .__dompick-selector-row {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      gap: 12px;
+      align-items: center;
+      margin-bottom = '8px';
+    }
+
+    .__dompick-selector-row:last-child {
+      margin-bottom: 0;
+    }
+
+    /* Специальные стили для кнопок режимов */
+    .__dompick-mode-btn {
+      position: relative;
+      overflow: hidden;
+      border-radius: 8px;
+      padding: 6px 12px;
+      font-size: 11px;
+      font-weight: 500;
+      transition: var(--dompick-transition);
+      border: 2px solid transparent;
+    }
+
+    .__dompick-mode-btn.active {
+      background: var(--dompick-accent-secondary);
+      border-color: var(--dompick-accent-primary);
+      color: var(--dompick-accent-tertiary);
+      box-shadow: 0 0 0 2px var(--dompick-accent-primary);
+    }
+
+    .__dompick-mode-btn:not(.active) {
+      background: var(--dompick-bg-secondary);
+      border-color: var(--dompick-border-secondary);
+      color: var(--dompick-text-secondary);
+    }
+
+    .__dompick-mode-btn:not(.active):hover {
+      background: var(--dompick-border-primary);
+      color: var(--dompick-text-primary);
+      transform: translateY(-1px);
+    }
+
+    /* Анимация переключения тем */
+    .__dompick-theme-transition {
+      transition: var(--dompick-transition);
+    }
+
+    /* Градиентные эффекты для активных элементов */
+    .__dompick-gradient-bg {
+      background: linear-gradient(135deg, var(--dompick-accent-secondary), var(--dompick-accent-primary));
+    }
+
+    
+
+    /* Эффект волны при клике на кнопки */
+    .__dompick-mode-btn {
+      position: relative;
+      overflow: hidden;
+    }
+
+    .__dompick-mode-btn::after {
+      content: '';
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      width: 0;
+      height: 0;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.3);
+      transform: translate(-50%, -50%);
+      transition: width 0.6s, height 0.6s;
+    }
+
+    .__dompick-mode-btn:active::after {
+      width: 300px;
+      height: 300px;
+    }
+
+    /* Улучшенные hover эффекты */
+    .__dompick-mode-btn:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    }
+
+    .__dompick-mode-btn.active:hover {
+      transform: translateY(-1px);
+    }
+
+    /* Анимация появления модального окна */
+    .__dompick-dialog {
+      animation: __dompick-modal-enter 0.4s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+    }
+
+    @keyframes __dompick-modal-enter {
+      0% {
+        transform: scale(0.8) translateY(20px);
+        opacity: 0;
+      }
+      100% {
+        transform: scale(1) translateY(0);
+        opacity: 1;
+      }
+    }
+
+    /* Эффект параллакса для backdrop */
+    .__dompick-backdrop {
+      animation: __dompick-backdrop-enter 0.3s ease-out forwards;
+    }
+
+    @keyframes __dompick-backdrop-enter {
+      from {
+        opacity: 0;
+        backdrop-filter: blur(0px);
+      }
+      to {
+        opacity: 1;
+        backdrop-filter: blur(4px);
+      }
+    }
+
+    /* Стили для индикатора режима */
+    #__dompick-mode-indicator {
+      transition: var(--dompick-transition);
+      animation: __dompick-indicator-pulse 0.6s ease-out;
+    }
+
+    @keyframes __dompick-indicator-pulse {
+      0% {
+        transform: scale(0.8);
+        opacity: 0.7;
+      }
+      50% {
+        transform: scale(1.1);
+        opacity: 1;
+      }
+      100% {
+        transform: scale(1);
+        opacity: 1;
+      }
+    }
+
+    /* Улучшенные стили для кнопок режимов */
+    .__dompick-mode-btn {
+      font-weight: 500;
+      letter-spacing: 0.5px;
+    }
+
+    .__dompick-mode-btn.active {
+      font-weight: 600;
+    }
+
+    /* Эффект градиента для активных кнопок */
+    .__dompick-mode-btn.active {
+      background: linear-gradient(135deg, var(--dompick-accent-secondary), var(--dompick-accent-primary));
+      border-color: var(--dompick-accent-primary);
+      color: var(--dompick-accent-tertiary);
+      box-shadow: 0 0 0 2px var(--dompick-accent-primary), 0 4px 12px rgba(0, 0, 0, 0.3);
+    }
   `;
   document.head.appendChild(styleEl);
 
@@ -54,20 +514,33 @@
   // Версия UI
   const __dompickVersion = 'v1.08';
 
+  // Глобальный кэш для селекторов в обоих режимах
+  let __dompickSelectorCache = null;
+  let __dompickCachedElement = null;
+
   // ==== Панель ====
   const panel = document.createElement('div');
-  panel.className = '__dompick-panel';
+  panel.className = '__dompick-panel __dompick-theme-transition';
   panel.innerHTML = `
     <div style="display: flex; justify-content: space-between; align-items: flex-start; width: 100%;">
       <div style="flex: 1;">
-        <div style="font-weight: bold; margin-bottom: 4px;">DOM Picker <span style="opacity:.6">${__dompickVersion}</span></div>
+        <div style="font-weight: bold; margin-bottom: 4px; color: var(--dompick-text-primary);">
+          DOM Picker <span style="opacity:.6; color: var(--dompick-text-secondary);">${__dompickVersion}</span>
+          <span id="__dompick-mode-indicator" style="margin-left:8px; font-size:10px; padding:2px 6px; border-radius:4px; background:var(--dompick-accent-secondary); color:var(--dompick-accent-tertiary);">
+            ${__dompickMode === 'js' ? '🔧 JS' : '⚡ Cypress'}
+          </span>
+        </div>
         <div class="__dompick-help" id="__dompick-help">
           <div>Ctrl+клик - показать селекторы</div>
         </div>
         <div style="margin-top:6px; display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
-          <span style="opacity:.8">Режим:</span>
-          <button class="__dompick-btn" id="__dompick-mode-cypress">Cypress</button>
-          <button class="__dompick-btn" id="__dompick-mode-js">JS</button>
+          <span style="opacity:.8; color: var(--dompick-text-secondary);">Режим:</span>
+          <button class="__dompick-mode-btn" id="__dompick-mode-cypress">
+            <span style="margin-right:4px;">⚡</span>Cypress
+          </button>
+          <button class="__dompick-mode-btn" id="__dompick-mode-js">
+            <span style="margin-right:4px;">🔧</span>JS
+          </button>
         </div>
       </div>
       <button class="__dompick-btn-close" id="__dompick-close">Закрыть</button>
@@ -78,21 +551,148 @@
   // Кнопки переключения режима
   const modeBtnCypress = panel.querySelector('#__dompick-mode-cypress');
   const modeBtnJs = panel.querySelector('#__dompick-mode-js');
+  
   const applyModeStyles = () => {
     if (!modeBtnCypress || !modeBtnJs) return;
-    const activeStyle = 'background:#065f46;border-color:#059669;color:#10b981';
-    const inactiveStyle = 'background:#1f2937;border-color:#4b5563;color:#e5e7eb';
+    
+    // Добавляем класс для плавного перехода
+    document.body.classList.add('__dompick-theme-transition');
+    
+    // Удаляем все классы тем с body
+    document.body.classList.remove('__dompick-theme-js', '__dompick-theme-cypress');
+    
+    // Применяем соответствующую тему
     if (__dompickMode === 'js') {
-      modeBtnJs.style.cssText = activeStyle;
-      modeBtnCypress.style.cssText = inactiveStyle;
+      document.body.classList.add('__dompick-theme-js');
+      modeBtnJs.classList.add('active');
+      modeBtnCypress.classList.remove('active');
     } else {
-      modeBtnCypress.style.cssText = activeStyle;
-      modeBtnJs.style.cssText = inactiveStyle;
+      document.body.classList.add('__dompick-theme-cypress');
+      modeBtnCypress.classList.add('active');
+      modeBtnJs.classList.remove('active');
     }
+    
+         // Убираем эффект свечения с обеих кнопок
+     modeBtnJs.classList.remove('__dompick-glow');
+     modeBtnCypress.classList.remove('__dompick-glow');
+    
+    // Показываем уведомление о смене режима
+    const modeName = __dompickMode === 'js' ? 'JavaScript' : 'Cypress';
+    showToast(`Режим переключен на ${modeName}`);
+    
+    // Обновляем индикатор режима
+    const modeIndicator = panel.querySelector('#__dompick-mode-indicator');
+    if (modeIndicator) {
+      modeIndicator.textContent = __dompickMode === 'js' ? '🔧 JS' : '⚡ Cypress';
+      modeIndicator.style.background = 'var(--dompick-accent-secondary)';
+      modeIndicator.style.color = 'var(--dompick-accent-tertiary)';
+    }
+    
+    // Обновляем содержимое модального окна, если оно открыто
+    updateModalContent();
+    
+    // Убираем класс перехода через некоторое время
+    setTimeout(() => {
+      document.body.classList.remove('__dompick-theme-transition');
+    }, 300);
   };
+  
+  // Функция для обновления содержимого модального окна при смене режима
+  const updateModalContent = () => {
+    const modal = document.querySelector('.__dompick-modal');
+    if (!modal) return;
+    
+    const groupsContainer = modal.querySelector('.__dompick-groups');
+    if (!groupsContainer) return;
+    
+    // НЕТ зафиксированного элемента → просим выбрать
+    if (!__dompickCachedElement) {
+      groupsContainer.innerHTML = '<div style="opacity:.8;font-size:12px;color:var(--dompick-text-secondary)">' +
+        'Сначала выберите элемент (Ctrl+клик).' +
+        '</div>';
+      return;
+    }
+    
+    // Обновляем заголовок модального окна
+    const title = modal.querySelector('.__dompick-title');
+    if (title) {
+      title.textContent = `Селекторы для ${__dompickMode === 'js' ? 'JS' : 'Cypress'}`;
+    }
+    
+    // Если есть кэш для текущего режима, используем его
+    if (__dompickSelectorCache && __dompickCachedElement && __dompickSelectorCache[__dompickMode]) {
+      // Очищаем содержимое
+      groupsContainer.innerHTML = '';
+      
+      const availableActions = getAvailableActions(__dompickCachedElement);
+      const cachedGroups = __dompickSelectorCache[__dompickMode];
+      
+      createSelectorGroup(groupsContainer, 'Базовые селекторы', cachedGroups.basicSelectors, cachedGroups.moreBasic, availableActions, 'basic');
+      const containsTitle = (__dompickMode === 'js') ? 'Селекторы по тексту' : 'Селекторы с .contains';
+      createSelectorGroup(groupsContainer, containsTitle, cachedGroups.containsSelectors, cachedGroups.moreContains, availableActions, 'contains');
+      createSelectorGroup(groupsContainer, 'Позиционные селекторы', cachedGroups.nthSelectors, cachedGroups.moreNth, availableActions, 'nth');
+
+      if (cachedGroups.aggressive && cachedGroups.aggressive.length > 0) {
+        createSelectorGroup(groupsContainer, 'Агрессивные селекторы', cachedGroups.aggressive.slice(0, 5), cachedGroups.aggressive.slice(5), availableActions, 'aggressive');
+      }
+      return;
+    }
+    
+    // Если кэша нет, показываем состояние загрузки и генерируем селекторы синхронно
+    groupsContainer.innerHTML = '<div id="__dompick-loading" style="opacity:.8;font-size:12px;color:var(--dompick-text-secondary)">Генерация селекторов...</div>';
+    
+    // Небольшая задержка чтобы пользователь увидел сообщение о загрузке
+    setTimeout(() => {
+      // Генерируем селекторы для текущего режима синхронно
+      resetPerfGuards();
+      __buildBudgetEnd = performance.now() + 5000;
+      
+      const groups = buildCandidates(__dompickCachedElement);
+      
+      // Инициализируем кэш если его нет
+      if (!__dompickSelectorCache) {
+        __dompickSelectorCache = {};
+      }
+      
+      // Сохраняем селекторы для текущего режима
+      __dompickSelectorCache[__dompickMode] = groups;
+      
+      // Отображаем селекторы
+      const loading = groupsContainer.querySelector('#__dompick-loading');
+      if (loading) loading.remove();
+      
+      const availableActions = getAvailableActions(__dompickCachedElement);
+      
+      createSelectorGroup(groupsContainer, 'Базовые селекторы', groups.basicSelectors, groups.moreBasic, availableActions, 'basic');
+      const containsTitle = (__dompickMode === 'js') ? 'Селекторы по тексту' : 'Селекторы с .contains';
+      createSelectorGroup(groupsContainer, containsTitle, groups.containsSelectors, groups.moreContains, availableActions, 'contains');
+      createSelectorGroup(groupsContainer, 'Позиционные селекторы', groups.nthSelectors, groups.moreNth, availableActions, 'nth');
+
+      if (groups.aggressive && groups.aggressive.length > 0) {
+        createSelectorGroup(groupsContainer, 'Агрессивные селекторы', groups.aggressive.slice(0, 5), groups.aggressive.slice(5), availableActions, 'aggressive');
+      }
+      
+      // ГАРАНТИЯ: если ни одного селектора не сгенерировалось — формируем абсолютный CSS‑путь
+      const totalCount = groups.basicSelectors.length + groups.containsSelectors.length + groups.nthSelectors.length + (groups.aggressive?.length || 0);
+      if (totalCount === 0) {
+        const absPath = buildAbsoluteCssPath(__dompickCachedElement);
+        const fallback = [{ sel: absPath }];
+        createSelectorGroup(groupsContainer, 'Агрессивные селекторы (fallback)', fallback, [], availableActions, 'aggressive');
+      }
+      
+      resetPerfGuards();
+    }, 200); // Небольшая задержка для обновления UI
+  };
+
   if (modeBtnCypress && modeBtnJs) {
-    modeBtnCypress.addEventListener('click', () => { __dompickMode = 'cypress'; applyModeStyles(); });
-    modeBtnJs.addEventListener('click', () => { __dompickMode = 'js'; applyModeStyles(); });
+    modeBtnCypress.addEventListener('click', () => { 
+      __dompickMode = 'cypress'; 
+      applyModeStyles(); 
+    });
+    modeBtnJs.addEventListener('click', () => { 
+      __dompickMode = 'js'; 
+      applyModeStyles(); 
+    });
     applyModeStyles();
   }
 
@@ -155,14 +755,39 @@
 
 
   document.getElementById('__dompick-close').addEventListener('click', () => {
+    // 1) Снять режим выбора и убрать оверлей
+    if (typeof deactivateSelectionMode === 'function') {
+      deactivateSelectionMode();
+    }
+    
+    // 2) Удалить все открытые модалки/тосты на всякий случай
+    document.querySelectorAll('.__dompick-modal').forEach(m => m.remove());
+    const toast = document.querySelector('.__dompick-toast');
+    if (toast) toast.remove();
+    
+    // 3) Убрать все наши подсветки
+    document.querySelectorAll('.__dompick-highlight')
+      .forEach(el => el.classList.remove('__dompick-highlight'));
+    
+    // 4) Снять классы темы с body
+    document.body.classList.remove('__dompick-theme-js','__dompick-theme-cypress','__dompick-theme-transition');
+    
+    // 5) Снять листенеры как и было
     window.removeEventListener('click', onClick, true);
     window.removeEventListener('mouseover', onMouseOver, true);
     window.removeEventListener('mouseout', onMouseOut, true);
     window.removeEventListener('keydown', onKeyDown, true);
     window.removeEventListener('keyup', onKeyUp, true);
+    
+    // 6) Удалить панель и стили
     clearAllHighlights();
     panel.remove();
     styleEl.remove();
+    
+    // 7) Сбросить флаги/кэши и перф-кэш
+    if (typeof resetPerfGuards === 'function') resetPerfGuards();
+    __dompickSelectorCache = null;
+    __dompickCachedElement = null;
     window.__domPickerActive = false;
   });
 
@@ -2596,21 +3221,85 @@
   }
 
   // ==== UI ====
-  function showToast(msg){ let t=document.querySelector('.__dompick-toast'); if(!t){ t=document.createElement('div'); t.className='__dompick-toast'; document.body.appendChild(t); } t.textContent=msg; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),1400); }
+  function showToast(msg){ 
+    let t=document.querySelector('.__dompick-toast'); 
+    if(!t){ 
+      t=document.createElement('div'); 
+      t.className='__dompick-toast'; 
+      // Всегда добавляем toast в body для правильного z-index
+      document.body.appendChild(t);
+    } 
+    t.textContent=msg; 
+    t.classList.add('show'); 
+    setTimeout(()=>t.classList.remove('show'),1400); 
+  }
   function openModalFor(el) {
+    // Проверяем кэш для этого элемента
+    if (__dompickSelectorCache && __dompickCachedElement === el) {
+      // Используем кэшированные селекторы
+      const modal = document.createElement('div');
+      modal.className = '__dompick-modal';
+      modal.innerHTML = `
+        <div class="__dompick-backdrop"></div>
+        <div class="__dompick-dialog __dompick-theme-transition">
+          <div class="__dompick-head">
+            <div class="__dompick-title">Селекторы для ${__dompickMode === 'js' ? 'JS' : 'Cypress'}</div>
+            <button class="__dompick-copy" data-close>✖</button>
+          </div>
+          <div class="__dompick-body">
+            <div class="__dompick-groups">
+              <div id="__dompick-loading" style="opacity:.8;font-size:12px;color:var(--dompick-text-secondary)">Загрузка из кэша...</div>
+            </div>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(modal);
+
+      const groupsContainer = modal.querySelector('.__dompick-groups');
+      const closeModal = () => {
+        if (fixedHighlighted) {
+          removeHighlight(fixedHighlighted);
+          fixedHighlighted = null;
+        }
+        modal.remove();
+      };
+      modal.querySelector('[data-close]').addEventListener('click', closeModal);
+      modal.querySelector('.__dompick-backdrop').addEventListener('click', closeModal);
+      modal.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal(); });
+
+      // Быстро отображаем кэшированные селекторы
+      setTimeout(() => {
+        const loading = groupsContainer.querySelector('#__dompick-loading');
+        if (loading) loading.remove();
+
+        const availableActions = getAvailableActions(el);
+        const cachedGroups = __dompickSelectorCache[__dompickMode] || __dompickSelectorCache.cypress; // fallback
+
+        createSelectorGroup(groupsContainer, 'Базовые селекторы', cachedGroups.basicSelectors, cachedGroups.moreBasic, availableActions, 'basic');
+        const containsTitle = (__dompickMode === 'js') ? 'Селекторы по тексту' : 'Селекторы с .contains';
+        createSelectorGroup(groupsContainer, containsTitle, cachedGroups.containsSelectors, cachedGroups.moreContains, availableActions, 'contains');
+        createSelectorGroup(groupsContainer, 'Позиционные селекторы', cachedGroups.nthSelectors, cachedGroups.moreNth, availableActions, 'nth');
+
+        if (cachedGroups.aggressive && cachedGroups.aggressive.length > 0) {
+          createSelectorGroup(groupsContainer, 'Агрессивные селекторы', cachedGroups.aggressive.slice(0, 5), cachedGroups.aggressive.slice(5), availableActions, 'aggressive');
+        }
+      }, 50);
+      return;
+    }
+
     // Открываем модалку СРАЗУ, а тяжёлую генерацию переносим на idle/next-tick
     const modal = document.createElement('div');
     modal.className = '__dompick-modal';
     modal.innerHTML = `
       <div class="__dompick-backdrop"></div>
-      <div class="__dompick-dialog">
+      <div class="__dompick-dialog __dompick-theme-transition">
         <div class="__dompick-head">
           <div class="__dompick-title">Селекторы для ${__dompickMode === 'js' ? 'JS' : 'Cypress'}</div>
           <button class="__dompick-copy" data-close>✖</button>
         </div>
         <div class="__dompick-body">
           <div class="__dompick-groups">
-            <div id="__dompick-loading" style="opacity:.8;font-size:12px">Генерация селекторов...</div>
+            <div id="__dompick-loading" style="opacity:.8;font-size:12px;color:var(--dompick-text-secondary)">Генерация селекторов...</div>
           </div>
         </div>
       </div>
@@ -2623,6 +3312,9 @@
         removeHighlight(fixedHighlighted);
         fixedHighlighted = null;
       }
+      // Очищаем кэш при закрытии модального окна
+      __dompickSelectorCache = null;
+      __dompickCachedElement = null;
       modal.remove();
     };
     modal.querySelector('[data-close]').addEventListener('click', closeModal);
@@ -2634,7 +3326,16 @@
       // Устанавливаем увеличенный бюджет на генерацию и чистим кэш
       resetPerfGuards();
       __buildBudgetEnd = performance.now() + 5000; // можно увеличить при необходимости
+      
+      // Генерируем селекторы для текущего режима
       const groups = buildCandidates(el);
+      
+      // Инициализируем кэш
+      __dompickSelectorCache = {
+        [__dompickMode]: groups
+      };
+      __dompickCachedElement = el;
+      
       resetPerfGuards();
 
       const availableActions = getAvailableActions(el);
@@ -2658,6 +3359,8 @@
         const fallback = [{ sel: absPath }];
         createSelectorGroup(groupsContainer, 'Агрессивные селекторы (fallback)', fallback, [], availableActions, 'aggressive');
       }
+      
+      // Убираем фоновую генерацию - селекторы для противоположного режима будут генерироваться при первом переключении
     };
 
     if ('requestIdleCallback' in window) {
@@ -2679,7 +3382,7 @@
     const titleDiv = document.createElement('div');
     titleDiv.style.fontWeight = 'bold';
     titleDiv.style.marginBottom = '8px';
-    titleDiv.style.color = '#10b981';
+    titleDiv.style.color = 'var(--dompick-accent-tertiary)';
     titleDiv.style.fontSize = '13px';
     titleDiv.textContent = title;
     groupDiv.appendChild(titleDiv);
@@ -2733,21 +3436,83 @@
   function __escapeJsString(s){
     try { return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'"); } catch { return s; }
   }
+  function convertJsToCypressBase(jsExpr) {
+    if (!jsExpr || typeof jsExpr !== 'string') return 'cy.get("body")';
+    let expr = jsExpr.trim().replace(/;\s*$/, '');
+    
+    // Проверяем, является ли это уже Cypress селектором
+    if (expr.includes('cy.get(') || expr.includes('cy.contains(')) {
+      // Это уже Cypress селектор, возвращаем как есть
+      return expr;
+    }
+    
+    // document.querySelector('sel')
+    let m = expr.match(/^document\.querySelector\((['"])(.+?)\1\)$/);
+    if (m) {
+      const sel = m[2];
+      return `cy.get('${sel}')`;
+    }
+    
+    // Array.from(document.querySelectorAll('*')).find(el => el.textContent.includes('text'))
+    m = expr.match(/Array\.from\(document\.querySelectorAll\('([^']+)'\)\)\.find\(el => el\.textContent\.includes\('([^']+)'\)\)/);
+    if (m) {
+      const selector = m[1];
+      const text = m[2];
+      if (selector === '*') {
+        return `cy.contains('${text}')`;
+      } else {
+        return `cy.get('${selector}').contains('${text}')`;
+      }
+    }
+    
+    // Array.from(document.querySelectorAll('tag')).find(el => el.textContent.includes('text'))
+    m = expr.match(/Array\.from\(document\.querySelectorAll\('([a-zA-Z][a-zA-Z0-9-]*)'\)\)\.find\(el => el\.textContent\.includes\('([^']+)'\)\)/);
+    if (m) {
+      const tag = m[1];
+      const text = m[2];
+      return `cy.contains('${tag}', '${text}')`;
+    }
+    
+    // Агрессивные JS селекторы - создаем простой fallback
+    if (expr.includes('(()=>{') || expr.includes('document.querySelector') || expr.includes('Array.from')) {
+      // Для агрессивных селекторов возвращаем базовый селектор
+      return 'cy.get("body")';
+    }
+    
+    // Любая другая форма: пробуем вытащить document.querySelector('...')
+    m = expr.match(/document\.querySelector\((['"])(.+?)\1\)/);
+    if (m) {
+      const sel = m[2];
+      return `cy.get('${sel}')`;
+    }
+    
+    return 'cy.get("body")';
+  }
+
   function convertCypressToJsBase(cyExpr){
     if (!cyExpr || typeof cyExpr !== 'string') return 'document.body';
     let expr = cyExpr.trim().replace(/;\s*$/, '');
+    
+    // Проверяем, является ли это агрессивным JS селектором
+    if (expr.includes('(()=>{') || expr.includes('document.querySelector') || expr.includes('Array.from')) {
+      // Это уже JS селектор, возвращаем как есть
+      return expr;
+    }
+    
     // cy.get('sel')
     let m = expr.match(/^cy\.get\((['"])(.+?)\1\)$/);
     if (m) {
       const sel = __escapeJsString(m[2]);
       return `document.querySelector('${sel}')`;
     }
+    
     // cy.contains('text')
     m = expr.match(/^cy\.contains\((['"])(.+?)\1\)$/);
     if (m) {
       const txt = __escapeJsString(m[2]);
       return `Array.from(document.querySelectorAll('*')).find(el => el && el.textContent && el.textContent.includes('${txt}'))`;
     }
+    
     // cy.contains('tag', 'text')
     m = expr.match(/^cy\.contains\((['"])([a-zA-Z][a-zA-Z0-9-]*)\1,\s*(['"])(.+?)\3\)$/);
     if (m) {
@@ -2755,6 +3520,7 @@
       const txt = __escapeJsString(m[4]);
       return `Array.from(document.querySelectorAll('${tag}')).find(el => el && el.textContent && el.textContent.includes('${txt}'))`;
     }
+    
     // cy.get('sel').contains('text')
     m = expr.match(/^cy\.get\((['"])(.+?)\1\)\.contains\((['"])(.+?)\3\)$/);
     if (m) {
@@ -2762,6 +3528,7 @@
       const txt = __escapeJsString(m[4]);
       return `Array.from(document.querySelectorAll('${sel}')).find(el => el && el.textContent && el.textContent.includes('${txt}'))`;
     }
+    
     // cy.get('sel').contains('tag','text')
     m = expr.match(/^cy\.get\((['"])(.+?)\1\)\.contains\((['"])([a-zA-Z][a-zA-Z0-9-]*)\3,\s*(['"])(.+?)\5\)$/);
     if (m) {
@@ -2770,6 +3537,7 @@
       const txt = __escapeJsString(m[6]);
       return `Array.from((document.querySelector('${scope}')||document).querySelectorAll('${tag}')).find(el => el && el.textContent && el.textContent.includes('${txt}'))`;
     }
+    
     // cy.get('sel').filter(':visible').contains('text')
     m = expr.match(/^cy\.get\((['"])(.+?)\1\)\.filter\('\:visible'\)\.contains\((['"])(.+?)\3\)$/);
     if (m) {
@@ -2777,6 +3545,7 @@
       const txt = __escapeJsString(m[4]);
       return `Array.from(document.querySelectorAll('${sel}')).filter(el => el && el.offsetParent !== null).find(el => el.textContent && el.textContent.includes('${txt}'))`;
     }
+    
     // cy.get('sel').filter(':visible').contains('tag','text')
     m = expr.match(/^cy\.get\((['"])(.+?)\1\)\.filter\('\:visible'\)\.contains\((['"])([a-zA-Z][a-zA-Z0-9-]*)\3,\s*(['"])(.+?)\5\)$/);
     if (m) {
@@ -2785,6 +3554,7 @@
       const txt = __escapeJsString(m[6]);
       return `Array.from((document.querySelector('${scope}')||document).querySelectorAll('${tag}')).filter(el => el && el.offsetParent !== null).find(el => el.textContent && el.textContent.includes('${txt}'))`;
     }
+    
     // cy.get('sel').find('sub').eq(n)
     m = expr.match(/^cy\.get\((['"])(.+?)\1\)\.find\((['"])(.+?)\3\)\.eq\((\d+)\)$/);
     if (m) {
@@ -2793,6 +3563,7 @@
       const idx = Number(m[5]) || 0;
       return `Array.from((document.querySelector('${scope}')||document).querySelectorAll('${sub}'))[${idx}]`;
     }
+    
     // cy.get('sel').find('sub')
     m = expr.match(/^cy\.get\((['"])(.+?)\1\)\.find\((['"])(.+?)\3\)$/);
     if (m) {
@@ -2800,12 +3571,14 @@
       const sub = __escapeJsString(m[4]);
       return `(document.querySelector('${scope}')||document).querySelector('${sub}')`;
     }
+    
     // Любая другая форма: пробуем вытащить первый cy.get('...')
     m = expr.match(/cy\.get\((['"])(.+?)\1\)/);
     if (m) {
       const sel = __escapeJsString(m[2]);
       return `document.querySelector('${sel}')`;
     }
+    
     return 'document.body';
   }
 
@@ -2830,7 +3603,14 @@
         }
         return `document.querySelector('${selector.sel}')`;
       } else {
-        return selector.isCypress ? selector.sel : `cy.get('${selector.sel}')`;
+        if (selector.isCypress) {
+          return selector.sel;
+        }
+        // Если это JS селектор, конвертируем в Cypress
+        if (selector.isJs || selector.sel.includes('document.querySelector') || selector.sel.includes('Array.from')) {
+          return convertJsToCypressBase(selector.sel);
+        }
+        return `cy.get('${selector.sel}')`;
       }
     };
     const displayText = buildBaseForMode();
@@ -2840,7 +3620,16 @@
     const selectorPart = document.createElement('div');
     selectorPart.className = '__dompick-item';
     selectorPart.style.marginBottom = '0';
-    selectorPart.innerHTML = `<div><b>${number}.</b> <code style="font-size: 11px;">${displayText.replace(/</g,'&lt;')}</code></div>`;
+    
+    // Сохраняем оригинальный селектор и информацию о типе в data-атрибутах
+    const codeElement = document.createElement('code');
+    codeElement.style.fontSize = '11px';
+    codeElement.textContent = displayText;
+    codeElement.setAttribute('data-original-selector', selector.sel);
+    codeElement.setAttribute('data-was-cypress', selector.isCypress ? 'true' : 'false');
+    
+    selectorPart.innerHTML = `<div><b>${number}.</b> </div>`;
+    selectorPart.querySelector('div').appendChild(codeElement);
     
     // Бейдж рейтинга (0..100), цвет от красного к зелёному
     const rawScore = (typeof computeSelectorScore === 'function') ? computeSelectorScore(selector, selector.__targetEl || null) : 0;
