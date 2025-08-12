@@ -2,19 +2,18 @@
   if (window.__domPickerActive) { console.warn('DOM Picker уже активен'); return; }
   window.__domPickerActive = true;
 
-  // === DEBUG/PROFILING CONFIG ===
-  // Включение: window.__dompickDebug = true; (до инъекции скрипта)
-  // Дополнительно: window.__dompickDebugLevel = 'trace' | 'info'
-  // Порог медленной сборки/запроса можно переопределить глобалями ниже.
+  // =========================================================================
+  // РАЗДЕЛ 1: КОНФИГУРАЦИЯ И ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
+  // =========================================================================
 
-  window.__dompickDebug = false;
-  // window.__dompickDebugLevel = 'trace';
-
+  // --- Конфигурация ---
+  // Определяет настройки работы скрипта, такие как таймауты, отладочные флаги и пороги.
+  // Настройки могут быть переопределены через глобальные переменные window.
   const __dompickConfig = (() => {
     try {
       const fromLS = (k) => (typeof localStorage !== 'undefined' && localStorage.getItem(k)) || null;
       return {
-        debug: !!(window.__dompickDebug ?? (fromLS('__dompickDebug') === '1')),
+        debug: true, // Включен режим дебага
         logLevel: String(window.__dompickDebugLevel || 'info'),
         buildBudgetMs: Number(window.__dompickBudgetMs || 5000),
         slowBuildThresholdMs: Number(window.__dompickSlowBuildThresholdMs || 2000),
@@ -36,7 +35,20 @@
     }
   })();
 
-  // Простые утилиты логирования
+  // --- Глобальные переменные состояния ---
+  // Хранят текущее состояние приложения: активный режим, выбранные элементы и т.д.
+  let currentHighlighted = null;
+  let fixedHighlighted = null;
+  let isCtrlPressed = false;
+  let isSelectionModeActive = false;
+  let overlayEl = null;
+  let lastHoveredElement = null;
+  let __dompickMode = 'cypress'; // Режим вывода: 'cypress' | 'js'
+  const __dompickVersion = 'v1.12'; // Версия UI
+  let __dompickSelectorCache = null; // Глобальный кэш для селекторов в обоих режимах
+  let __dompickCachedElement = null;
+
+  // --- Переменные для отладки и производительности ---
   const __perfStats = {
     buildRuns: [],                           // {ctx, ms, basic, contains, nth, aggressive}
     strategies: Object.create(null),         // {name: [ms, ...]}
@@ -44,119 +56,19 @@
     misc: { getAllTexts: [], findStableScope: [] }, // [ms,...]
     totals: { isUniqueCalls: 0, isUniqueMisses: 0, isUniqueHits: 0, qsaTimeMs: 0 }
   };
-  function __dlog(level, ...args) {
-    if (!__dompickConfig.debug) return;
-    const ok = __dompickConfig.logLevel === 'trace' || level !== 'trace';
-    if (ok) console.log('[DOMPick]', ...args);
-  }
-  function __timeit(name, fn) {
-    const t0 = performance.now();
-    const res = fn();
-    const dt = performance.now() - t0;
-    if (__dompickConfig.debug) {
-      (__perfStats.strategies[name] || (__perfStats.strategies[name] = [])).push(dt);
-      if (dt > __dompickConfig.slowQueryThresholdMs) {
-        __dlog('info', `⚠️ медленная стратегия ${name}: ${dt.toFixed(1)}ms`);
-      }
-    }
-    return res;
-  }
-  function __dumpPerfSummary(ctx, groups) {
-    if (!__dompickConfig.debug) return;
-    const lastRun = __perfStats.buildRuns[__perfStats.buildRuns.length - 1];
-    console.groupCollapsed(`🧪 DOMPick Perf (${ctx}) · ${lastRun?.ms?.toFixed?.(1)}ms`);
-    if (groups) {
-      console.log('Counts:', {
-        basic: groups.basicSelectors?.length, contains: groups.containsSelectors?.length,
-        nth: groups.nthSelectors?.length, aggressive: (groups.aggressive?.length || 0)
-      });
-    }
-    console.log('isUnique:', __perfStats.totals, 'samples:', __perfStats.isUnique.length);
-    const stratAvg = Object.fromEntries(Object.entries(__perfStats.strategies).map(([k, arr]) => {
-      const sum = arr.reduce((a,b)=>a+b,0); return [k, { calls: arr.length, avgMs: +(sum/arr.length).toFixed(2), sumMs: +sum.toFixed(1) }];
-    }));
-    console.table(stratAvg);
-    if (__perfStats.isUnique.length) {
-      console.table(__perfStats.isUnique.slice(0, 20));
-    }
-    console.groupEnd();
-  }
+  let __buildBudgetEnd = 0; // timestamp (performance.now) когда прекращаем дорогие операции
+  const __queryCache = new Map(); // selector -> Array<Element>
 
-  // Утилиты для гейтинга стратегий
-  function __canRun(name, weight = 1) {
-    if (budgetExpired()) {
-      __dlog('info', `⏰ ${name}: пропуск (бюджет истёк)`);
-      return false;
-    }
-    const remaining = __buildBudgetEnd - performance.now();
-    if (remaining < __dompickConfig.strategyBudgetMs * weight) {
-      __dlog('info', `⏰ ${name}: пропуск (остаток ${remaining.toFixed(0)}ms < ${__dompickConfig.strategyBudgetMs * weight}ms)`);
-      return false;
-    }
-    return true;
-  }
-
-  function __countDescendants(el, cap = 5000) {
-    let count = 0;
-    const walker = document.createTreeWalker(el, NodeFilter.SHOW_ELEMENT, null, false);
-    while (walker.nextNode() && count < cap) count++;
-    return count;
-  }
-
-  // --- безопасная установка HTML на страницах с Trusted Types ---
-  const setTrustedHTML = (() => {
-    let policy = null;
-
-    // 1) Если доступен Sanitizer API — используем его
-    const canSanitize = typeof Element.prototype.setHTML === 'function' && 'Sanitizer' in window;
-
-    // 2) Пытаемся создать TT-политику (имя 'default' часто разрешено; fallback — своё имя)
-    if (window.trustedTypes) {
-      try { policy = trustedTypes.createPolicy('default', { createHTML: s => s }); } catch {}
-      if (!policy) {
-        try { policy = trustedTypes.createPolicy('dompick', { createHTML: s => s }); } catch {}
-      }
-    }
-
-    return (el, html) => {
-      // a) Через Sanitizer API
-      if (canSanitize) {
-        try { el.setHTML(html, { sanitizer: new Sanitizer() }); return; } catch {}
-      }
-      // b) Через Trusted Types (если политику дали создать)
-      if (policy) {
-        el.innerHTML = policy.createHTML(html);
-        return;
-      }
-      // c) Фолбэк: парсим строку и вставляем готовые узлы (без innerHTML)
-      while (el.firstChild) el.removeChild(el.firstChild);
-      const doc = new DOMParser().parseFromString(html, 'text/html');
-      const frag = document.createDocumentFragment();
-      for (const node of Array.from(doc.body.childNodes)) frag.appendChild(node);
-      el.appendChild(frag);
-    };
-  })();
-
-  const clearNode = (el) => { while (el.firstChild) el.removeChild(el.firstChild); };
-
-  // ==== УТИЛИТА ДЛЯ ПЕРЕТАСКИВАНИЯ (всегда целиком во вьюпорте) ====
+  // =========================================================================
+  // РАЗДЕЛ 2: СТИЛИ И UI КОМПОНЕНТЫ
+  // =========================================================================
+  
+  // --- Утилита для перетаскивания элемента ---
 /**
  * Делает элемент перетаскиваемым с прилипаниями к краям и гарантией полной видимости.
- *
  * @param {HTMLElement} targetEl
  * @param {HTMLElement} handleEl
  * @param {Object} options
- * @param {boolean} [options.keepFixed=true]
- * @param {'both'|'x'|'y'} [options.axis='both']
- * @param {boolean} [options.snapOnDrop=true]
- * @param {number}  [options.snapThreshold=24]
- * @param {number}  [options.minLeft=0]
- * @param {number}  [options.minTop=0]
- * @param {number}  [options.minRight=0]
- * @param {number}  [options.minBottom=0]
- * @param {Function} [options.onDragStart]
- * @param {Function} [options.onDrag]
- * @param {Function} [options.onDragEnd]
  */
 function makeDraggable(targetEl, handleEl, options = {}) {
   if (!targetEl) return;
@@ -174,8 +86,8 @@ function makeDraggable(targetEl, handleEl, options = {}) {
 
   // --- состояние драга
   let dragging = false;
-  let startX = 0, startY = 0;        // координаты указателя при старте
-  let baseLeft = 0, baseTop = 0;     // абсолютная позиция ЭЛЕМЕНТА при старте (origin для дельты)
+  let startX = 0, startY = 0; // координаты указателя при старте
+  let baseLeft = 0, baseTop = 0; // абсолютная позиция ЭЛЕМЕНТА при старте (origin для дельты)
   let lastAbsLeft = 0, lastAbsTop = 0; // последние рассчитанные абсолютные координаты
   let rAF = null;
 
@@ -230,30 +142,24 @@ function makeDraggable(targetEl, handleEl, options = {}) {
     const minTop  = opts.minTop;
     const maxLeft = Math.max(minLeft, vw - w - opts.minRight);
     const maxTop  = Math.max(minTop,  vh - h - opts.minBottom);
-
     let L = Math.min(Math.max(left, minLeft), maxLeft);
     let T = Math.min(Math.max(top,  minTop ), maxTop);
-
     return { left: L, top: T, vw, vh, w, h };
   };
 
   // Притяжение к ближайшему краю (по абсолютным координатам)
   const applyEdgeSnap = (left, top) => {
     const { vw, vh, w, h } = clampFullyVisible(left, top);
-
     const dLeft   = left;
     const dRight  = vw - (left + w);
     const dTop    = top;
     const dBottom = vh - (top + h);
-
     const minD = Math.min(dLeft, dRight, dTop, dBottom);
     if (minD > opts.snapThreshold) return { left, top };
-
     if (dLeft === minD)       left = 0 + opts.minLeft;
     else if (dRight === minD) left = vw - w - opts.minRight;
     else if (dTop === minD)   top  = 0 + opts.minTop;
     else                      top  = vh - h - opts.minBottom;
-
     const safe = clampFullyVisible(left, top);
     return { left: safe.left, top: safe.top };
   };
@@ -278,7 +184,6 @@ function makeDraggable(targetEl, handleEl, options = {}) {
     dragging = true;
 
     setupPositioning();
-
     // отключаем анимации на время драга
     targetEl.__prevTransition = targetEl.style.transition;
     targetEl.style.transition = 'none';
@@ -297,7 +202,6 @@ function makeDraggable(targetEl, handleEl, options = {}) {
     // база для дельт
     baseLeft = safe.left;
     baseTop  = safe.top;
-
     // координаты указателя
     startX = e.clientX;
     startY = e.clientY;
@@ -316,7 +220,6 @@ function makeDraggable(targetEl, handleEl, options = {}) {
 
   const onPointerMove = (e) => {
     if (!dragging) return;
-
     // дельты курсора
     let dx = e.clientX - startX;
     let dy = e.clientY - startY;
@@ -345,7 +248,6 @@ function makeDraggable(targetEl, handleEl, options = {}) {
   const onPointerUp = (e) => {
     if (!dragging) return;
     dragging = false;
-
     if (rAF) { cancelAnimationFrame(rAF); rAF = null; }
 
     // последние абсолютные координаты с учётом клампа
@@ -413,13 +315,42 @@ function makeDraggable(targetEl, handleEl, options = {}) {
   };
 }
 
+  // --- безопасная установка HTML на страницах с Trusted Types ---
+  const setTrustedHTML = (() => {
+    let policy = null;
 
-  // Очистка "хвостов" от предыдущего запуска
-  document.querySelectorAll('.__dompick-modal, .__dompick-overlay').forEach(n => n.remove());
-  document.querySelectorAll('.__dompick-highlight').forEach(el => el.classList.remove('__dompick-highlight'));
-  document.body.classList.remove('__dompick-theme-js','__dompick-theme-cypress','__dompick-theme-transition');
+    // 1) Если доступен Sanitizer API — используем его
+    const canSanitize = typeof Element.prototype.setHTML === 'function' && 'Sanitizer' in window;
 
-  // ==== Стили ====
+    // 2) Пытаемся создать TT-политику (имя 'default' часто разрешено; fallback — своё имя)
+    if (window.trustedTypes) {
+      try { policy = trustedTypes.createPolicy('default', { createHTML: s => s }); } catch {}
+      if (!policy) {
+        try { policy = trustedTypes.createPolicy('dompick', { createHTML: s => s }); } catch {}
+      }
+    }
+
+    return (el, html) => {
+      // a) Через Sanitizer API
+      if (canSanitize) {
+        try { el.setHTML(html, { sanitizer: new Sanitizer() }); return; } catch {}
+      }
+      // b) Через Trusted Types (если политику дали создать)
+      if (policy) {
+        el.innerHTML = policy.createHTML(html);
+        return;
+      }
+      // c) Фолбэк: парсим строку и вставляем готовые узлы (без innerHTML)
+      while (el.firstChild) el.removeChild(el.firstChild);
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const frag = document.createDocumentFragment();
+      for (const node of Array.from(doc.body.childNodes)) frag.appendChild(node);
+      el.appendChild(frag);
+    };
+  })();
+  
+  // --- Внедрение CSS стилей ---
+  // Создает и добавляет в <head> все необходимые стили для UI компонентов.
   const styleEl = document.createElement('style');
   styleEl.textContent = `
     /* CSS переменные для тем */
@@ -944,23 +875,7 @@ function makeDraggable(targetEl, handleEl, options = {}) {
   `;
   document.head.appendChild(styleEl);
 
-  // ==== Переменные состояния ====
-  let currentHighlighted = null;
-  let fixedHighlighted = null;
-  let isCtrlPressed = false;
-  let isSelectionModeActive = false;
-  let overlayEl = null;
-  let lastHoveredElement = null;
-  // Режим вывода: 'cypress' | 'js'
-  let __dompickMode = 'cypress';
-  // Версия UI
-  const __dompickVersion = 'v1.12';
-
-  // Глобальный кэш для селекторов в обоих режимах
-  let __dompickSelectorCache = null;
-  let __dompickCachedElement = null;
-
-  // ==== Панель ====
+  // --- Создание и управление основной панелью ---
   const panel = document.createElement('div');
   panel.className = '__dompick-panel __dompick-theme-transition';
   setTrustedHTML(panel, `
@@ -972,7 +887,8 @@ function makeDraggable(targetEl, handleEl, options = {}) {
         <div class="__dompick-help" id="__dompick-help">
           <div>Ctrl+клик - показать селекторы</div>
         </div>
-        <div style="margin-top:6px; display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+        <div style="margin-top:6px; display:flex; 
+          align-items:center; gap:6px; flex-wrap:wrap;">
           <span style="opacity:.8; color: var(--dompick-text-secondary);">Режим:</span>
           <button class="__dompick-mode-btn" id="__dompick-mode-cypress">
             <span style="margin-right:4px;">⚡</span>Cypress
@@ -982,6 +898,7 @@ function makeDraggable(targetEl, handleEl, options = {}) {
           </button>
         </div>
       </div>
+ 
       <div style="display:flex; gap:6px; align-items:center;">
         <button class="__dompick-drag" id="__dompick-drag-panel" title="Перетащить панель">⠿</button>
         <button class="__dompick-btn-close" id="__dompick-close">Закрыть</button>
@@ -989,33 +906,365 @@ function makeDraggable(targetEl, handleEl, options = {}) {
     </div>
   `);
   document.body.appendChild(panel);
-
-  // ==== Функции подсветки ====
-  // Сделаем панель перетаскиваемой за ручку
-  try {
-    const dragHandlePanel = panel.querySelector('#__dompick-drag-panel');
-    if (dragHandlePanel) {
-      // Для панели сохраняем фиксированное позиционирование (fixed)
-      makeDraggable(panel, dragHandlePanel, { constrainToViewport: true, keepFixed: true });
-      // Инициал: зафиксируем стартовые координаты, чтобы не "прыгало" при первом переносе
-      const r = panel.getBoundingClientRect();
-      panel.style.left = `${r.left}px`; panel.style.top = `${r.top}px`; panel.style.right = 'auto'; panel.style.bottom = 'auto';
-    }
-  } catch {}
-
-  // Кнопки переключения режима
-  const modeBtnCypress = panel.querySelector('#__dompick-mode-cypress');
-  const modeBtnJs = panel.querySelector('#__dompick-mode-js');
   
-  const applyModeStyles = () => {
-    if (!modeBtnCypress || !modeBtnJs) return;
+  // --- Уведомления (Toast) ---
+  function showToast(msg){ 
+    let t=document.querySelector('.__dompick-toast');
+    if(!t){ 
+      t=document.createElement('div'); 
+      t.className='__dompick-toast'; 
+      // Всегда добавляем toast в body для правильного z-index
+      document.body.appendChild(t);
+    } 
+    t.textContent=msg; 
+    t.classList.add('show'); 
+    setTimeout(()=>t.classList.remove('show'),1400); 
+  }
+  
+  // --- Управление модальным окном и темами ---
+  function openModalFor(el) {
+    // Проверяем кэш для этого элемента
+    if (__dompickSelectorCache && __dompickCachedElement === el) {
+      // Используем кэшированные селекторы
+      const modal = document.createElement('div');
+      modal.className = '__dompick-modal';
+      setTrustedHTML(modal, `
+        <div class="__dompick-backdrop"></div>
+        <div class="__dompick-dialog __dompick-theme-transition">
+          <div class="__dompick-head">
+            <div class="__dompick-title">Селекторы для ${__dompickMode === 'js' ? 'JS' : 'Cypress'}</div>
+            <button class="__dompick-copy" data-close>✖</button>
+          </div>
+          <div class="__dompick-body">
+          
+          <div class="__dompick-groups">
+              <div id="__dompick-loading" style="opacity:.8;font-size:12px;color:var(--dompick-text-secondary)">Загрузка из кэша...</div>
+            </div>
+          </div>
+        </div>
+      `);
+      document.body.appendChild(modal);
+
+      const groupsContainer = modal.querySelector('.__dompick-groups');
+      const closeModal = () => {
+        if (fixedHighlighted) {
+          removeHighlight(fixedHighlighted);
+          fixedHighlighted = null;
+        }
+        modal.remove();
+      };
+      modal.querySelector('[data-close]').addEventListener('click', closeModal);
+      modal.querySelector('.__dompick-backdrop').addEventListener('click', closeModal);
+      modal.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal(); });
+
+      // Быстро отображаем кэшированные селекторы
+      setTimeout(() => {
+        const loading = groupsContainer.querySelector('#__dompick-loading');
+        if (loading) loading.remove();
+
+        const availableActions = getAvailableActions(el);
+        const cachedGroups = __dompickSelectorCache[__dompickMode] || __dompickSelectorCache.cypress; // fallback
+
+        createSelectorGroup(groupsContainer, 'Базовые селекторы CSS', cachedGroups.basicSelectors, cachedGroups.moreBasic, availableActions, 'basic');
+        const containsTitle = (__dompickMode === 'js') ? 'Селекторы по тексту' : 'Селекторы с .contains';
+     
+       createSelectorGroup(groupsContainer, containsTitle, cachedGroups.containsSelectors, cachedGroups.moreContains, availableActions, 'contains');
+        createSelectorGroup(groupsContainer, 'Позиционные селекторы', cachedGroups.nthSelectors, cachedGroups.moreNth, availableActions, 'nth');
+        createSelectorGroup(groupsContainer, 'XPath селекторы', cachedGroups.xpathSelectors || [], cachedGroups.moreXPath || [], availableActions, 'xpath');
+        if (cachedGroups.aggressive && cachedGroups.aggressive.length > 0) {
+          createSelectorGroup(groupsContainer, 'Агрессивные селекторы', cachedGroups.aggressive.slice(0, 5), cachedGroups.aggressive.slice(5), availableActions, 'aggressive');
+        }
+      }, 50);
+      return;
+    }
+
+    // Открываем модалку СРАЗУ, а тяжёлую генерацию переносим на idle/next-tick
+    const modal = document.createElement('div');
+    modal.className = '__dompick-modal';
+    setTrustedHTML(modal, `
+      <div class="__dompick-backdrop"></div>
+      <div class="__dompick-dialog __dompick-theme-transition">
+        <div class="__dompick-head">
+          <div class="__dompick-title">Селекторы для ${__dompickMode === 'js' ? 'JS' : 'Cypress'}</div>
+          <button class="__dompick-copy" data-close>✖</button>
+        </div>
+        <div class="__dompick-body">
+          <div class="__dompick-groups">
+            <div 
+              id="__dompick-loading" style="opacity:.8;font-size:12px;color:var(--dompick-text-secondary)">Генерация селекторов...</div>
+          </div>
+        </div>
+      </div>
+    `);
+    document.body.appendChild(modal);
+
+    const groupsContainer = modal.querySelector('.__dompick-groups');
+    const closeModal = () => {
+      if (fixedHighlighted) {
+        removeHighlight(fixedHighlighted);
+        fixedHighlighted = null;
+      }
+      // Очищаем кэш при закрытии модального окна
+      __dompickSelectorCache = null;
+      __dompickCachedElement = null;
+      modal.remove();
+    };
+    modal.querySelector('[data-close]').addEventListener('click', closeModal);
+    modal.querySelector('.__dompick-backdrop').addEventListener('click', closeModal);
+    modal.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal(); });
+
+    // Планируем асинхронную генерацию с тайм-бюджетом
+    const runAsync = () => { // фоновая (idle/next-tick) генерация селекторов
+      // Устанавливаем увеличенный бюджет на генерацию и чистим кэш
+      resetPerfGuards();
+      const __buildStart = performance.now();
+      __buildBudgetEnd = __buildStart + (__dompickConfig.buildBudgetMs || 5000); // можно увеличить при необходимости
+      
+      // Генерируем селекторы для текущего режима
+      const groups = buildCandidates(el);
+      const __buildMs = performance.now() - __buildStart;
+      if (__dompickConfig.debug) {
+        __perfStats.buildRuns.push({ ctx: 'modalAsync', ms: __buildMs,
+          basic: groups.basicSelectors.length, contains: groups.containsSelectors.length,
+          nth: groups.nthSelectors.length, aggressive: (groups.aggressive?.length || 0)
+        });
+        if (__buildMs > __dompickConfig.slowBuildThresholdMs) {
+          __dlog('info', `⏱️ генерация (async) заняла ${__buildMs.toFixed(1)}ms (>${__dompickConfig.slowBuildThresholdMs}ms)`);
+        }
+      }
+      
+      // Инициализируем кэш
+      __dompickSelectorCache = {
+        [__dompickMode]: groups
+      };
+      __dompickCachedElement = el;
+      
+      resetPerfGuards();
+
+      const availableActions = getAvailableActions(el);
+      const loading = groupsContainer.querySelector('#__dompick-loading');
+      if (loading) loading.remove();
+      createSelectorGroup(groupsContainer, 'Базовые селекторы CSS', groups.basicSelectors, groups.moreBasic, availableActions, 'basic');
+      const containsTitle = (__dompickMode === 'js') ? 'Селекторы по тексту' : 'Селекторы с .contains';
+      createSelectorGroup(groupsContainer, containsTitle, groups.containsSelectors, groups.moreContains, availableActions, 'contains');
+      createSelectorGroup(groupsContainer, 'Позиционные селекторы', groups.nthSelectors, groups.moreNth, availableActions, 'nth');
+      createSelectorGroup(groupsContainer, 'XPath селекторы', groups.xpathSelectors || [], groups.moreXPath || [], availableActions, 'xpath');
+
+      // Если есть агрессивные — тоже показываем
+      if (groups.aggressive && groups.aggressive.length > 0) {
+        createSelectorGroup(groupsContainer, 'Агрессивные селекторы', groups.aggressive.slice(0, 5), groups.aggressive.slice(5), availableActions, 'aggressive');
+      }
+
+      // ГАРАНТИЯ: если ни одного селектора не сгенерировалось — формируем абсолютный CSS‑путь
+      const totalCount = groups.basicSelectors.length + groups.containsSelectors.length + groups.nthSelectors.length + (groups.xpathSelectors?.length || 0) + (groups.aggressive?.length || 0);
+      if (totalCount === 0) {
+        const absPath = buildAbsoluteCssPath(el);
+        const fallback = [{ sel: absPath }];
+        createSelectorGroup(groupsContainer, 'Агрессивные селекторы (fallback)', fallback, [], availableActions, 'aggressive');
+      }
+      
+      resetPerfGuards();
+      __dumpPerfSummary('modalAsync', groups);
+      // Убираем фоновую генерацию - селекторы для противоположного режима будут генерироваться при первом переключении
+    };
+
+    if ('requestIdleCallback' in window) {
+      window.requestIdleCallback(runAsync, { timeout: 250 });
+    } else {
+      setTimeout(runAsync, 0);
+    }
+  }
+
+  // Создание группы селекторов в модальном окне
+  function createSelectorGroup(container, title, selectors, moreSelectors, availableActions, groupType) {
+    if (selectors.length === 0 && moreSelectors.length === 0) return;
+    const groupDiv = document.createElement('div');
+    groupDiv.className = '__dompick-group';
+    groupDiv.style.marginBottom = '20px';
     
+    // Заголовок группы
+    const titleDiv = document.createElement('div');
+    titleDiv.style.fontWeight = 'bold';
+    titleDiv.style.marginBottom = '8px';
+    titleDiv.style.color = 'var(--dompick-accent-tertiary)';
+    titleDiv.style.fontSize = '13px';
+    titleDiv.textContent = title;
+    groupDiv.appendChild(titleDiv);
+
+    // Контейнер для селекторов этой группы
+    const selectorsContainer = document.createElement('div');
+    selectorsContainer.className = `__dompick-selectors-${groupType}`;
+    groupDiv.appendChild(selectorsContainer);
+
+    // Добавляем основные селекторы
+    selectors.forEach((selector, index) => {
+      addSelectorToGroup(selectorsContainer, selector, availableActions, index + 1);
+    });
+
+    // Кнопка "Показать ещё вариантов" если есть дополнительные селекторы
+    if (moreSelectors.length > 0) {
+      const moreButton = document.createElement('button');
+      moreButton.className = '__dompick-btn';
+      moreButton.textContent = `Показать ещё вариантов (${moreSelectors.length})`;
+      moreButton.style.marginTop = '8px';
+      moreButton.style.fontSize = '11px';
+      
+      let moreShown = false;
+      moreButton.addEventListener('click', () => {
+        const currentSelectorCount = selectorsContainer.querySelectorAll('.__dompick-item').length;
+        const additionalCount = Math.min(5, moreSelectors.length); // Показываем по 5 дополнительных
+        
+        for (let i = 0; i < additionalCount; i++) {
+          const selector = moreSelectors[i];
+          addSelectorToGroup(selectorsContainer, selector, availableActions, currentSelectorCount + i + 1);
+        }
+      
+        // Обновляем кнопку
+        const remaining = moreSelectors.length - additionalCount;
+        if (remaining > 0) {
+          moreButton.textContent = `Показать ещё вариантов (${remaining})`;
+          // Убираем показанные селекторы из массива
+          moreSelectors.splice(0, additionalCount);
+        } else {
+          moreButton.style.display = 'none';
+        }
+      });
+      
+      groupDiv.appendChild(moreButton);
+    }
+    
+    container.appendChild(groupDiv);
+  }
+
+  // Добавление строки с селектором в группу
+  function addSelectorToGroup(container, selector, availableActions, number) {
+    const selectorRow = document.createElement('div');
+    selectorRow.className = '__dompick-selector-row';
+    selectorRow.style.display = 'grid';
+    selectorRow.style.gridTemplateColumns = '1fr auto auto';
+    selectorRow.style.gap = '12px';
+    selectorRow.style.alignItems = 'center';
+    selectorRow.style.marginBottom = '8px';
+    
+    const buildBaseForMode = () => {
+      // ✅ XPath: показываем корректные выражения для текущего режима
+      if (selector.isXPath) {
+        if (__dompickMode === 'js') {
+          return `document.evaluate(${JSON.stringify(selector.sel)}, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue`;
+        } else {
+          // Для Cypress c плагином cypress-xpath
+          return `cy.xpath(${JSON.stringify(selector.sel)})`;
+        }
+      }
+
+      if (__dompickMode === 'js') {
+        if (selector.isCypress) return convertCypressToJsBase(selector.sel);
+        if (selector.isJs) return selector.sel;
+        return `document.querySelector('${selector.sel}')`;
+      } else {
+        if (selector.isCypress) return selector.sel;
+        if (selector.isJs || selector.sel.includes('document.querySelector') || selector.sel.includes('Array.from')) {
+          return convertJsToCypressBase(selector.sel);
+        }
+        return `cy.get('${selector.sel}')`;
+      }
+    };
+    const displayText = buildBaseForMode();
+    const copyText = displayText;
+    
+    // Левая часть - селектор
+    const selectorPart = document.createElement('div');
+    selectorPart.className = '__dompick-item';
+    selectorPart.style.marginBottom = '0';
+    
+    // Сохраняем оригинальный селектор и информацию о типе в data-атрибутах
+    const codeElement = document.createElement('code');
+    codeElement.style.fontSize = '11px';
+    codeElement.textContent = displayText;
+    codeElement.setAttribute('data-original-selector', selector.sel);
+    codeElement.setAttribute('data-was-cypress', selector.isCypress ? 'true' : 'false');
+    
+    setTrustedHTML(selectorPart, `<div><b>${number}.</b> </div>`);
+    selectorPart.querySelector('div').appendChild(codeElement);
+
+    // Бейдж рейтинга (0..100), цвет от красного к зелёному
+    const rawScore = (typeof computeSelectorScore === 'function') ? computeSelectorScore(selector, selector.__targetEl || null) : 0;
+    const normalized = Math.max(0, Math.min(100, Math.round(50 + 50 * Math.tanh(rawScore / 80)))) ;
+    const hue = Math.round((normalized / 100) * 120); // 0 (red) -> 120 (green)
+    const ratingBadge = document.createElement('div');
+    ratingBadge.className = '__dompick-rating';
+    ratingBadge.textContent = String(normalized);
+    ratingBadge.title = `Рейтинг селектора: ${normalized} (raw: ${rawScore})`;
+    ratingBadge.style.minWidth = '36px';
+    ratingBadge.style.textAlign = 'center';
+    ratingBadge.style.fontSize = '10px';
+    ratingBadge.style.fontWeight = 'bold';
+    ratingBadge.style.color = '#fff';
+    ratingBadge.style.padding = '2px 6px';
+    ratingBadge.style.borderRadius = '6px';
+    ratingBadge.style.background = `linear-gradient(90deg, hsl(${hue}, 70%, 45%), hsl(${hue}, 70%, 38%))`;
+    ratingBadge.style.boxShadow = '0 0 0 1px rgba(0,0,0,.05) inset';
+
+    // Правая часть - кнопки
+    const buttonsContainer = document.createElement('div');
+    buttonsContainer.className = '__dompick-buttons';
+    buttonsContainer.style.flexShrink = '0'; // Не сжимать кнопки
+    
+    // Основная кнопка "Копировать"
+    const copyBtn = document.createElement('button');
+    copyBtn.className = '__dompick-copy';
+    copyBtn.textContent = 'Копировать';
+    copyBtn.style.fontSize = '10px';
+    copyBtn.addEventListener('click', () => {
+      navigator.clipboard.writeText(copyText).then(() => showToast('Скопировано'));
+    });
+    buttonsContainer.appendChild(copyBtn);
+    
+    // Кнопки действий
+    availableActions.forEach(action => {
+      const actionBtn = document.createElement('button');
+      actionBtn.className = '__dompick-action';
+      actionBtn.textContent = `.${action}()`;
+      actionBtn.style.fontSize = '10px';
+      actionBtn.addEventListener('click', () => {
+        let actionText = '';
+        if (__dompickMode === 'js') {
+          if (action === 'type') actionText = `${copyText}.value = 'текст';`;
+          else if (action === 'select') actionText = `${copyText}.value = 'значение';`;
+          else if (action === 'check') actionText = `${copyText}.checked = true;`;
+          else if (action === 'uncheck') actionText = `${copyText}.checked = false;`;
+          else if (action === 'clear') actionText = `${copyText}.value = '';`;
+          else actionText = `${copyText}.click();`;
+        } else {
+           actionText = action === 'type' ? 
+            `${copyText}.${action}('текст');` :
+            action === 'select' ?
+            `${copyText}.${action}('значение');` :
+            `${copyText}.${action}();`;
+        }
+        navigator.clipboard.writeText(actionText).then(() => showToast(`Скопировано: .${action}()`));
+      });
+      buttonsContainer.appendChild(actionBtn);
+    });
+    
+    selectorRow.appendChild(selectorPart);
+    selectorRow.appendChild(ratingBadge);
+    selectorRow.appendChild(buttonsContainer);
+    container.appendChild(selectorRow);
+  }
+
+  // --- Управление темами и режимами ---
+  const applyModeStyles = () => {
+    const modeBtnCypress = panel.querySelector('#__dompick-mode-cypress');
+    const modeBtnJs = panel.querySelector('#__dompick-mode-js');
+    if (!modeBtnCypress || !modeBtnJs) return;
+
     // Добавляем класс для плавного перехода
     document.body.classList.add('__dompick-theme-transition');
-    
+
     // Удаляем все классы тем с body
     document.body.classList.remove('__dompick-theme-js', '__dompick-theme-cypress');
-    
+
     // Применяем соответствующую тему
     if (__dompickMode === 'js') {
       document.body.classList.add('__dompick-theme-js');
@@ -1045,7 +1294,7 @@ function makeDraggable(targetEl, handleEl, options = {}) {
     
     // Обновляем содержимое модального окна, если оно открыто
     updateModalContent();
-    
+
     // Убираем класс перехода через некоторое время
     setTimeout(() => {
       document.body.classList.remove('__dompick-theme-transition');
@@ -1059,7 +1308,7 @@ function makeDraggable(targetEl, handleEl, options = {}) {
     
     const groupsContainer = modal.querySelector('.__dompick-groups');
     if (!groupsContainer) return;
-    
+
     // НЕТ зафиксированного элемента → просим выбрать
     if (!__dompickCachedElement) {
       setTrustedHTML(groupsContainer, '<div style="opacity:.8;font-size:12px;color:var(--dompick-text-secondary)">' +
@@ -1078,7 +1327,6 @@ function makeDraggable(targetEl, handleEl, options = {}) {
     if (__dompickSelectorCache && __dompickCachedElement && __dompickSelectorCache[__dompickMode]) {
       // Очищаем содержимое
       clearNode(groupsContainer);
-      
       const availableActions = getAvailableActions(__dompickCachedElement);
       const cachedGroups = __dompickSelectorCache[__dompickMode];
       
@@ -1087,7 +1335,7 @@ function makeDraggable(targetEl, handleEl, options = {}) {
       createSelectorGroup(groupsContainer, containsTitle, cachedGroups.containsSelectors, cachedGroups.moreContains, availableActions, 'contains');
       createSelectorGroup(groupsContainer, 'Позиционные селекторы', cachedGroups.nthSelectors, cachedGroups.moreNth, availableActions, 'nth');
       createSelectorGroup(groupsContainer, 'XPath селекторы', cachedGroups.xpathSelectors || [], cachedGroups.moreXPath || [], availableActions, 'xpath');
-        if (cachedGroups.aggressive && cachedGroups.aggressive.length > 0) {
+      if (cachedGroups.aggressive && cachedGroups.aggressive.length > 0) {
         createSelectorGroup(groupsContainer, 'Агрессивные селекторы', cachedGroups.aggressive.slice(0, 5), cachedGroups.aggressive.slice(5), availableActions, 'aggressive');
       }
       return;
@@ -1095,7 +1343,7 @@ function makeDraggable(targetEl, handleEl, options = {}) {
     
     // Если кэша нет, показываем состояние загрузки и генерируем селекторы синхронно
     setTrustedHTML(groupsContainer, '<div id="__dompick-loading" style="opacity:.8;font-size:12px;color:var(--dompick-text-secondary)">Генерация селекторов...</div>');
-    
+
     // Небольшая задержка чтобы пользователь увидел сообщение о загрузке
     setTimeout(() => {
       // Генерируем селекторы для текущего режима синхронно
@@ -1122,13 +1370,12 @@ function makeDraggable(targetEl, handleEl, options = {}) {
       
       // Сохраняем селекторы для текущего режима
       __dompickSelectorCache[__dompickMode] = groups;
-      
+
       // Отображаем селекторы
       const loading = groupsContainer.querySelector('#__dompick-loading');
       if (loading) loading.remove();
       
       const availableActions = getAvailableActions(__dompickCachedElement);
-      
       createSelectorGroup(groupsContainer, 'Базовые селекторы CSS', groups.basicSelectors, groups.moreBasic, availableActions, 'basic');
       const containsTitle = (__dompickMode === 'js') ? 'Селекторы по тексту' : 'Селекторы с .contains';
       createSelectorGroup(groupsContainer, containsTitle, groups.containsSelectors, groups.moreContains, availableActions, 'contains');
@@ -1150,32 +1397,409 @@ function makeDraggable(targetEl, handleEl, options = {}) {
       __dumpPerfSummary('modalAsync', groups);
     }, 200); // Небольшая задержка для обновления UI
   };
+  
+  // =========================================================================
+  // РАЗДЕЛ 3: ГЛАВНЫЕ ОБРАБОТЧИКИ СОБЫТИЙ
+  // =========================================================================
+  
+  // --- Управление режимом выбора (Selection Mode) ---
+  const activateSelectionMode = () => {
+    if (isSelectionModeActive) return;
+    isSelectionModeActive = true;
+    if (!overlayEl) {
+      overlayEl = document.createElement('div');
+      overlayEl.className = '__dompick-overlay';
+    }
 
-  if (modeBtnCypress && modeBtnJs) {
-    modeBtnCypress.addEventListener('click', () => { 
-      __dompickMode = 'cypress'; 
-      applyModeStyles(); 
-    });
-    modeBtnJs.addEventListener('click', () => { 
-      __dompickMode = 'js'; 
-      applyModeStyles(); 
-    });
-    applyModeStyles();
+    const handleMove = (e) => {
+      const x = e.clientX;
+      const y = e.clientY;
+      // Временно скрываем overlay, чтобы получить реальный элемент под курсором
+      overlayEl.style.display = 'none';
+      const raw = document.elementFromPoint(x, y);
+      overlayEl.style.display = '';
+
+      // Если попали в нашу панель/модалку — игнорируем
+      if (!raw || raw === panel || (raw.closest && raw.closest('.__dompick-panel, .__dompick-modal'))) {
+        if (currentHighlighted && currentHighlighted !== fixedHighlighted) {
+          removeHighlight(currentHighlighted);
+          currentHighlighted = null;
+        }
+        lastHoveredElement = null;
+        return;
+      }
+
+      const target = snapTarget(raw);
+      if (!target || target === panel || panel.contains(target) || (target.closest && target.closest('.__dompick-panel, .__dompick-modal'))) {
+        return;
+      }
+
+      if (currentHighlighted && currentHighlighted !== fixedHighlighted && currentHighlighted !== target) {
+        removeHighlight(currentHighlighted);
+      }
+      currentHighlighted = target;
+      highlightElement(target);
+      lastHoveredElement = target;
+    };
+
+    const handleClick = (e) => {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      let target = lastHoveredElement;
+      if (!target) {
+        // На всякий случай определим элемент под кликом
+        overlayEl.style.display = 'none';
+        const raw = document.elementFromPoint(e.clientX, e.clientY);
+        overlayEl.style.display = '';
+        if (raw && !(raw === panel || (raw.closest && raw.closest('.__dompick-panel, .__dompick-modal')))) {
+          target = snapTarget(raw);
+        }
+      }
+
+      if (target && !(target === panel || panel.contains(target))) {
+        if (fixedHighlighted) {
+          removeHighlight(fixedHighlighted);
+        }
+        fixedHighlighted = target;
+        highlightElement(target);
+        openModalFor(target);
+      }
+
+      // После клика — выходим из режима
+      deactivateSelectionMode();
+    };
+
+    overlayEl.addEventListener('mousemove', handleMove, true);
+    overlayEl.addEventListener('click', handleClick, true);
+    document.body.appendChild(overlayEl);
+
+    // Сохраним ссылки на обработчики для безопасного снятия
+    overlayEl.__dompickMove = handleMove;
+    overlayEl.__dompickClick = handleClick;
+  };
+
+  const deactivateSelectionMode = () => {
+    if (!isSelectionModeActive) return;
+    isSelectionModeActive = false;
+    lastHoveredElement = null;
+    if (overlayEl) {
+      if (overlayEl.__dompickMove) overlayEl.removeEventListener('mousemove', overlayEl.__dompickMove, true);
+      if (overlayEl.__dompickClick) overlayEl.removeEventListener('click', overlayEl.__dompickClick, true);
+      if (overlayEl.parentNode) overlayEl.parentNode.removeChild(overlayEl);
+    }
+    // Убираем hover-подсветку, не трогая зафиксированную
+    if (currentHighlighted && currentHighlighted !== fixedHighlighted) {
+      removeHighlight(currentHighlighted);
+      currentHighlighted = null;
+    }
+  };
+  
+  // --- Обработчики событий клавиатуры и мыши ---
+  function onKeyDown(e) {
+    if (e.key === 'Control') {
+      isCtrlPressed = true;
+      // Входим в режим выбора
+      activateSelectionMode();
+    }
   }
 
-  // ==== Функции подсветки ====
+  function onKeyUp(e) {
+    if (e.key === 'Control') {
+      isCtrlPressed = false;
+      // Выходим из режима выбора
+      deactivateSelectionMode();
+      // Убираем hover подсветку когда отпускаем Ctrl
+      if (currentHighlighted && currentHighlighted !== fixedHighlighted) {
+        removeHighlight(currentHighlighted);
+        currentHighlighted = null;
+      }
+    }
+  }
+
+  function onMouseOver(e) {
+    if (!isCtrlPressed) return;
+    const target = snapTarget(e.target);
+    if (target === panel || panel.contains(target)) return;
+    if (target === fixedHighlighted) return; // не перекрываем зафиксированную подсветку
+    
+
+    // Убираем предыдущую hover подсветку
+    if (currentHighlighted && currentHighlighted !== fixedHighlighted) {
+      removeHighlight(currentHighlighted);
+    }
+    
+    currentHighlighted = target;
+    highlightElement(target);
+  }
+
+  function onMouseOut(e) {
+    if (!isCtrlPressed) return;
+    
+    const target = snapTarget(e.target);
+    if (currentHighlighted === target && target !== fixedHighlighted) {
+      removeHighlight(currentHighlighted);
+      currentHighlighted = null;
+    }
+  }
+
+  function onClick(e) {
+    if (!e.ctrlKey) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    
+    const target = snapTarget(e.target);
+    if (target === panel || panel.contains(target)) return;
+    
+    // Убираем предыдущую фиксированную подсветку
+    if (fixedHighlighted) {
+      removeHighlight(fixedHighlighted);
+    }
+    
+    // Фиксируем подсветку на кликнутом элементе
+    fixedHighlighted = target;
+    highlightElement(target);
+    
+    // Ctrl+клик - показываем селекторы
+    openModalFor(target);
+  }
+
+  // =========================================================================
+  // РАЗДЕЛ 4: ОСНОВНАЯ ЛОГИКА - ГЕНЕРАЦИЯ СЕЛЕКТОРОВ
+  // =========================================================================
+
+  // --- Функции-оркестраторы ---
+  // Управляют процессом сбора, категоризации и сортировки селекторов.
+  function buildCandidates(original) {
+    const el = snapTarget(original);
+    // Собираем все возможные селекторы
+    const allSelectors = collectAllSelectors(el);
+    // Группируем селекторы по типам
+    const groups = categorizeSelectors(allSelectors);
+    return {
+      basicSelectors: groups.basic.slice(0, 3),      // Первые 3 без .contains и nth-child
+      containsSelectors: groups.contains.slice(0, 3), // 4,5,6 с .contains
+      nthSelectors: groups.nth.slice(0, 3),          // 7,8,9 с nth-child
+      xpathSelectors: (groups.xpath || []).slice(0, 3),          // 7,8,9 с nth-child
+      
+      // Резервные селекторы для кнопок "ещё вариантов"
+     
+     moreBasic: groups.basic.slice(3),
+      moreContains: groups.contains.slice(3),
+      moreNth: groups.nth.slice(3),
+      moreXPath: (groups.xpath || []).slice(3),
+      
+      // Дополнительные агрессивные селекторы
+      aggressive: groups.aggressive
+    };
+  }
+
+  // Собирает все возможные селекторы, запуская различные стратегии.
+  function collectAllSelectors(el) { // :contentReference{index=7}
+    const allSelectors = [];
+    const candidatesMap = new Map();
+
+    // Добавляем селекторы порциями, проверяя бюджет
+    const addBatch = (batch) => {
+      for (const item of batch) {
+        if (budgetExpired()) break;
+        if (!candidatesMap.has(item.sel)) {
+          if (item.isCypress) {
+            if (validateCypressSelector(item.sel, el)) {
+              item.__targetEl = el;
+              candidatesMap.set(item.sel, item);
+              allSelectors.push(item);
+            }
+          } else {
+            item.__targetEl = el;
+            candidatesMap.set(item.sel, item);
+            allSelectors.push(item);
+          }
+        }
+      }
+    };
+
+    // 1) Самые быстрые стратегии
+    // Сначала стратегии без цифр (score уже понижен внутри)
+    addBatch(__timeit('byStableScopePath', () => byStableScopePath(el)));
+    addBatch(__timeit('byClassCombos', () => byClassCombos(el)));
+    addBatch(__timeit('byAttr', () => byAttr(el)));
+    addBatch(__timeit('byPreferredData', () => byPreferredData(el)));
+    addBatch(__timeit('byId', () => byId(el)));
+
+    // 2) Остальные базовые
+    addBatch(__timeit('byAnyData', () => byAnyData(el)));
+    addBatch(__timeit('uniqueWithinScope', () => uniqueWithinScope(el)));
+    addBatch(__timeit('nthPath', () => nthPath(el)));
+    addBatch(__timeit('byXPath', () => byXPath(el)));
+// Подсчитываем "хорошие" базовые селекторы для гейтинга
+    const goodBasicCount = allSelectors.length;
+    const haveEnoughBasic = goodBasicCount >= __dompickConfig.targetEnoughBasic;
+
+    // 3) Текстовые (дорогие) — гейтим по количеству базовых и размеру DOM
+    if (__dompickConfig.textSearchEnabled && !haveEnoughBasic) {
+      const descendants = __countDescendants(el, __dompickConfig.maxDescendantsForTextSearch + 1);
+      if (descendants <= __dompickConfig.maxDescendantsForTextSearch) {
+        if (__canRun('byCypressText', 2)) {
+          addBatch(__timeit('byCypressText', () => byCypressText(el)));
+        }
+        if (__canRun('byCypressCombo', 2)) {
+          addBatch(__timeit('byCypressCombo', () => byCypressCombo(el)));
+        }
+      } else {
+        __dlog('info', `📝 текстовые стратегии: пропуск (${descendants} потомков > ${__dompickConfig.maxDescendantsForTextSearch})`);
+      }
+    } else if (!__dompickConfig.textSearchEnabled) {
+      __dlog('info', '📝 текстовые стратегии: отключены глобально');
+    } else {
+      __dlog('info', `📝 текстовые стратегии: пропуск (достаточно базовых: ${goodBasicCount} >= ${__dompickConfig.targetEnoughBasic})`);
+    }
+
+    // Явный короткий текстовый селектор внутри стабильного scope
+    const scope = __timeit('findStableScope(in-collect)', () => findStableScope(el));
+    if (scope) {
+      const texts = __timeit('getAllTexts(scope-short)', () => getAllTexts(el)).filter(t => isGoodTextForContains(t));
+      const shortText = texts.find(t => t.length <= 25);
+      if (shortText) {
+        if (__dompickMode === 'js') {
+          addBatch([{ sel: buildJsFindInScope(scope.scopeSelector, '*', shortText, false) }]);
+        } else {
+          const escaped = shortText.replace(/'/g, "\\'");
+          const sel1 = `cy.get('${scope.scopeSelector}').contains('${escaped}')`;
+          addBatch([{ sel: sel1, isCypress: true }]);
+        }
+      }
+    }
+
+    // 4) Позиционные
+    if (!budgetExpired()) addBatch(__timeit('byNthChild', () => byNthChild(el)));
+    if (!budgetExpired()) addBatch(__timeit('byParentWithNth', () => byParentWithNth(el)));
+    if (!budgetExpired()) addBatch(__timeit('bySiblingSelectors', () => bySiblingSelectors(el)));
+    if (!budgetExpired()) addBatch(__timeit('byCalendarSelectors', () => byCalendarSelectors(el)));
+
+    // 5) Агрессивные — гейтим по размеру DOM и количеству базовых
+    if (__dompickConfig.aggressiveEnabled && !haveEnoughBasic) {
+      const totalDescendants = __countDescendants(document.body, __dompickConfig.domSizeSoftCap + 1);
+      if (totalDescendants <= __dompickConfig.domSizeSoftCap) {
+        if (__canRun('generateAggressiveFallbacks', 3)) {
+          addBatch(__timeit('generateAggressiveFallbacks', () => generateAggressiveFallbacks(el)));
+        }
+        if (__canRun('generateSuperAggressiveFallbacks', 4)) {
+          addBatch(__timeit('generateSuperAggressiveFallbacks', () => generateSuperAggressiveFallbacks(el)));
+        }
+      } else {
+        __dlog('info', `🔥 агрессивные стратегии: пропуск (DOM слишком большой: ${totalDescendants} > ${__dompickConfig.domSizeSoftCap})`);
+      }
+    } else if (!__dompickConfig.aggressiveEnabled) {
+      __dlog('info', '🔥 агрессивные стратегии: отключены глобально');
+    } else {
+      __dlog('info', `🔥 агрессивные стратегии: пропуск (достаточно базовых: ${goodBasicCount} >= ${__dompickConfig.targetEnoughBasic})`);
+    }
+
+    return allSelectors;
+  }
+
+  // Категоризует селекторы по группам и сортирует их по качеству.
+  function categorizeSelectors(selectors) {
+    const groups = {
+      basic: [],      // Без .contains и nth-child
+      contains: [],   // С .contains
+      nth: [],        // С nth-child
+      xpath: [],      // XPath
+      aggressive: []  // Агрессивные fallback
+    };
+    for (const selector of selectors) {
+      const sel = selector.sel;
+      
+            if (selector.isXPath) { groups.xpath.push(selector); continue; }
+      // contains → contains
+      if (sel.includes('cy.contains') || sel.includes('.contains(')) {
+        groups.contains.push(selector);
+        continue;
+      }
+      // nth → nth
+      if (sel.includes('nth-child') || sel.includes('nth-of-type') || 
+          sel.includes(':first-child') || sel.includes(':last-child') ||
+          sel.includes(':only-child') || sel.includes(':first-of-type') ||
+          sel.includes(':last-of-type') || sel.includes(':only-of-type') ||
+          sel.includes('nth(') || sel.includes('eq(')) {
+        groups.nth.push(selector);
+        continue;
+      }
+      // Агрессивные по структуре (вместо старого порога score)
+      if (isAggressiveSelector(sel)) {
+        groups.aggressive.push(selector);
+        continue;
+      }
+      groups.basic.push(selector);
+    }
+    
+    // Динамическая сортировка по новому рейтингу
+    const sortByQuality = (a, b) => {
+      const aScore = computeSelectorScore(a, a.__targetEl || null);
+      const bScore = computeSelectorScore(b, b.__targetEl || null);
+      if (aScore !== bScore) return bScore - aScore;
+      // При равенстве — более короткий лучше
+      return a.sel.length - b.sel.length;
+    };
+    
+    groups.basic.sort(sortByQuality);
+    groups.contains.sort(sortByQuality);
+    groups.nth.sort(sortByQuality);
+    groups.xpath.sort(sortByQuality);
+    groups.aggressive.sort(sortByQuality);
+    
+    return groups;
+  }
+
+  // --- Функции подсветки и выбора цели ---
+  
+  // Поднимается от элемента, на который навели, к более осмысленному (кнопка, ссылка и т.п.)
+  function snapTarget(el){
+    const originalEl = el; // Сохраняем исходный элемент
+    // Если исходный элемент несёт осмысленный текст — считаем его целевым,
+    // чтобы не подниматься до родителя с цифровым ID
+    try {
+      const origText = getElementText(originalEl);
+      if (isGoodTextForContains(origText)) {
+        return originalEl;
+      }
+    } catch {}
+    // Если навели на «листовой» инлайн-элемент (иконка, одиночный span и т.п.) — не поднимаемся
+    if (isLeafInlineElement(originalEl)) {
+      return originalEl;
+    }
+
+    let cur = el, depth = 0;
+    while (cur && depth < 6){
+      if (cur.matches && (cur.matches(interestingSel) || cur.id || cur.getAttribute && prefDataAttrs.some(a=>cur.getAttribute(a)))) {
+        // Если исходный элемент содержит хороший текст, сохраняем ссылку на него
+        const originalText = getElementText(originalEl);
+        if (isGoodTextForContains(originalText)) {
+          cur._originalTextElement = originalEl;
+        }
+        return cur;
+      }
+      cur = cur.parentElement; 
+      depth++;
+    }
+    return el;
+  }
+
+  // Добавляет класс подсветки к элементу
   const highlightElement = (el) => {
     if (el && el !== panel && !panel.contains(el)) {
       el.classList.add('__dompick-highlight');
     }
   };
 
+  // Удаляет класс подсветки
   const removeHighlight = (el) => {
     if (el) {
       el.classList.remove('__dompick-highlight');
     }
   };
 
+  // Очищает все активные подсветки
   const clearAllHighlights = () => {
     if (currentHighlighted) {
       removeHighlight(currentHighlighted);
@@ -1186,120 +1810,1011 @@ function makeDraggable(targetEl, handleEl, options = {}) {
       fixedHighlighted = null;
     }
   };
+  
+  // =========================================================================
+  // РАЗДЕЛ 5: СТРАТЕГИИ ГЕНЕРАЦИИ СЕЛЕКТОРОВ
+  // =========================================================================
 
+  // --- 5.1: Базовые CSS селекторы ---
+  function byId(el){
+    if (!el.id) return [];
+    const id = el.id;
+    const sel = `#${esc(id)}`;
+    if (!isUnique(sel, el)) return [];
+    // Если ID содержит цифры — исключаем из базовых: вернётся позже через uniqueWithinScope/агрессивные
+    if (hasDigits(id)) return [];
+    return [{ sel }];
+  }
 
+  function byPreferredData(el){
+    const out=[];
+    for(const a of prefDataAttrs){
+      const v=el.getAttribute&&el.getAttribute(a);
+      if(!v) continue;
+      const s=`[${a}="${esc(v)}"]`;
+      if(isUnique(s,el)) out.push({sel:s,score: hasDigits(v) ? 0 : 95});
+      const s2=`${el.tagName.toLowerCase()}${s}`;
+      if(isUnique(s2,el)) out.push({sel:s2,score: hasDigits(v) ? 0 : 93});
+    }
+    return out;
+  }
 
-  // Определяет все возможные действия для элемента
-  const getAvailableActions = (el) => {
+  function byAnyData(el){
+    const out=[];
+    if(!el.attributes) return out;
+    for(const {name,value} of el.attributes){
+      if(!name.startsWith('data-')||!value) continue;
+      const s=`[${name}="${esc(value)}"]`;
+      if(isUnique(s,el)) out.push({sel:s,score: hasDigits(value) ? 0 : 85});
+      const s2=`${el.tagName.toLowerCase()}${s}`;
+      if(isUnique(s2,el)) out.push({sel:s2,score: hasDigits(value) ? 0 : 83});
+    }
+    return out;
+  }
+
+  function byAttr(el){
+    const out=[];
+    for(const a of okAttrs){
+      const v=el.getAttribute&&el.getAttribute(a);
+      if(!v) continue;
+      const s=`[${a}="${esc(v)}"]`;
+      if(isUnique(s,el)) out.push({sel:s,score: hasDigits(v) ? 0 : 80});
+      const s2=`${el.tagName.toLowerCase()}${s}`;
+      if(isUnique(s2,el)) out.push({sel:s2,score: hasDigits(v) ? 0 : 78});
+    }
+    const role=el.getAttribute&&el.getAttribute('role');
+    const al=el.getAttribute&&el.getAttribute('aria-label');
+    if(role&&al){
+      const s=`[role="${esc(role)}"][aria-label="${esc(al)}"]`;
+      if(isUnique(s,el)) out.push({sel:s,score: hasDigits(role)||hasDigits(al) ? 0 : 82});
+    }
+    return out;
+  }
+
+  function byClassCombos(el){ 
+    const out=[]; 
+    const classes=el.classList ? [...el.classList].filter(c => 
+      c && 
+      !looksDynamic(c) && 
+      !c.startsWith('__dompick') // Исключаем служебные классы DOM Picker'а
+    ).slice(0,4) : [];
+    for(const c of classes){ 
+      const s=`.${esc(c)}`; 
+      if(isUnique(s,el)) out.push({sel:s,score: hasDigits(c) ? 0 : 70});
+      const s2=`${el.tagName.toLowerCase()}${s}`; 
+      if(isUnique(s2,el)) out.push({sel:s2,score: hasDigits(c) ? 0 : 72}); 
+    } 
+    
+    if(classes.length>=2){ 
+      const [a,b]=classes;
+      const s=`.${esc(a)}.${esc(b)}`; 
+      if(isUnique(s,el)) out.push({sel:s,score: (hasDigits(a)||hasDigits(b)) ? 0 : 73}); 
+      const s2=`${el.tagName.toLowerCase()}${s}`; 
+      if(isUnique(s2,el)) out.push({sel:s2,score: (hasDigits(a)||hasDigits(b)) ? 0 : 74});
+    } 
+    
+    return out; 
+  }
+
+  function bySimilarAttrs(el){ const out=[]; const similarAttrs=findSimilarAttrs(el);
+    for(const {name,value} of similarAttrs){ const s=`[${name}="${esc(value)}"]`; if(isUnique(s,el)) out.push({sel:s}); const s2=`${el.tagName.toLowerCase()}[${name}="${esc(value)}"]`; if(isUnique(s2,el)) out.push({sel:s2}); } return out;
+  }
+
+  // --- 5.2: Селекторы по тексту (Cypress & JS) ---
+  function byCypressText(el) {
+    const out = [];
+    const texts = getAllTexts(el);
     const tag = el.tagName.toLowerCase();
-    const type = el.type ? el.type.toLowerCase() : '';
-    const actions = [];
     
-    if (tag === 'input') {
-      if (type === 'text' || type === 'email' || type === 'password' || type === 'search' || type === 'url' || type === 'tel') {
-        actions.push('type', 'click', 'clear');
-      } else if (type === 'checkbox' || type === 'radio') {
-        actions.push('check', 'uncheck', 'click');
-      } else if (type === 'submit' || type === 'button') {
-        actions.push('click');
+    // Обрабатываем все найденные тексты
+    for (const text of texts) {
+      if (!isGoodTextForContains(text)) continue;
+      const escapedText = text.replace(/'/g, "\\'");
+      
+      if (__dompickMode === 'js') {
+        // Глобально уникальный текст
+        if (isUniqueByText(el, text)) {
+          out.push({ sel: buildJsFindInScope(null, '*', text, false), isJs: true });
+        }
+        // Уникален среди тега
+        if (isUniqueByText(el, text, tag)) {
+          out.push({ sel: buildJsFindInScope(null, tag, text, false), isJs: true });
+        }
+        // Специальные контейнеры (видимый)
+        const specialContainer = el.closest('.datepicker, .modal, .modal-body, .modal-content, .modal-dialog, .dropdown, .popup, .overlay, .sidebar, .panel');
+        if (specialContainer) {
+          const containerClass = specialContainer.classList[0];
+          if (containerClass && isUniqueByTextInParent(el, text, specialContainer)) {
+            out.push({ sel: buildJsFindInScope(`.${containerClass}`, '*', text, true), isJs: true });
+          }
+        }
+        // Уникальный контекст
+        if (!isUniqueByText(el, text)) {
+          const uniqueContext = findMinimalUniqueContext(el, text);
+          if (uniqueContext) {
+            out.push({ sel: buildJsFindInScope(uniqueContext, '*', text, false), isJs: true });
+          }
+        }
       } else {
-        actions.push('click');
+        // Режим Cypress
+        if (isUniqueByText(el, text)) {
+          const containsCmd = `cy.contains('${escapedText}')`;
+          out.push({sel: containsCmd, isCypress: true});
+        }
+        if (isUniqueByText(el, text, tag)) {
+          const containsWithTagCmd = `cy.contains('${tag}', '${escapedText}')`;
+          out.push({sel: containsWithTagCmd, isCypress: true});
+        }
+        const specialContainer = el.closest('.datepicker, .modal, .modal-body, .modal-content, .modal-dialog, .dropdown, .popup, .overlay, .sidebar, .panel');
+        if (specialContainer) {
+          const containerClass = specialContainer.classList[0];
+          if (containerClass && isUniqueByTextInParent(el, text, specialContainer)) {
+            const visibleContainsCmd = `cy.get('.${containerClass}').filter(':visible').contains('${escapedText}')`;
+            out.push({sel: visibleContainsCmd, isCypress: true});
+          }
+        }
+        if (!isUniqueByText(el, text)) {
+          const uniqueContext = findMinimalUniqueContext(el, text);
+          if (uniqueContext) {
+            const contextContainsCmd = `cy.get('${uniqueContext}').contains('${escapedText}')`;
+            out.push({sel: contextContainsCmd, isCypress: true});
+          }
+        }
       }
-    } else if (tag === 'select') {
-      actions.push('select', 'click');
-    } else if (tag === 'textarea') {
-      actions.push('type', 'click', 'clear');
-    } else if (tag === 'button' || tag === 'a' || el.getAttribute('role') === 'button') {
-      actions.push('click');
-    } else {
-      // Для остальных элементов - только клик
-      actions.push('click');
     }
     
-    return actions;
-  };
-
-
-
-  document.getElementById('__dompick-close').addEventListener('click', () => {
-    // 1) Снять режим выбора и убрать оверлей
-    if (typeof deactivateSelectionMode === 'function') {
-      deactivateSelectionMode();
-    }
+    return out;
+  }
+  
+  // Генерация комбинированных Cypress команд (селектор + текст)
+  function byCypressCombo(el) {
+    const out = [];
+    const texts = getAllTexts(el);
     
-    // 2) Удалить все открытые модалки/тосты на всякий случай
-    document.querySelectorAll('.__dompick-modal').forEach(m => m.remove());
-    const toast = document.querySelector('.__dompick-toast');
-    if (toast) toast.remove();
-    
-    // 3) Убрать все наши подсветки
-    document.querySelectorAll('.__dompick-highlight')
-      .forEach(el => el.classList.remove('__dompick-highlight'));
-    
-    // 4) Снять классы темы с body
-    document.body.classList.remove('__dompick-theme-js','__dompick-theme-cypress','__dompick-theme-transition');
-    
-    // 5) Снять листенеры как и было
-    window.removeEventListener('click', onClick, true);
-    window.removeEventListener('mouseover', onMouseOver, true);
-    window.removeEventListener('mouseout', onMouseOut, true);
-    window.removeEventListener('keydown', onKeyDown, true);
-    window.removeEventListener('keyup', onKeyUp, true);
-    
-    // 6) Удалить панель и стили
-    clearAllHighlights();
-    panel.remove();
-    styleEl.remove();
-    
-    // 7) Сбросить флаги/кэши и перф-кэш
-    if (typeof resetPerfGuards === 'function') resetPerfGuards();
-    __dompickSelectorCache = null;
-    __dompickCachedElement = null;
-    window.__domPickerActive = false;
-  });
-
-  // ==== Вспомогательные ====
-  const prefDataAttrs = ['data-testid','data-test','data-cy','data-qa','data-test-id','data-automation-id','for'];
-  const okAttrs = ['id','name','type','placeholder','href','value','role','aria-label','title','for'];
-  const interestingSel = 'button, a, input, select, textarea, label, [role="button"], [role="menuitem"], .select2-container, .select2-choice, .select2-selection, .select2-selection__rendered, .select2-drop, .select2-results, .select2-result, .select2-result-label, .select2-results__option, .select2-input';
-
-  const esc = (s) => CSS.escape(s);
-  const looksDynamic = (s='') => /\b\d{4,}\b|\b[a-f0-9]{6,}\b|__/i.test(s);
-  const hasDigits = (s='') => /\d/.test(s);
-
-  // Эвристика: «листовой» инлайн-элемент, который следует оставлять как есть (не подниматься к родителю)
-  const isLeafInlineElement = (el) => {
-    if (!el || el.nodeType !== 1) return false;
-    const tag = el.tagName ? el.tagName.toLowerCase() : '';
-    // Явные «иконко-подобные» и мелкие инлайны
-    const leafTags = new Set(['i','svg','img','use','path','picture','source','sup','sub','b','strong','em','small','span']);
-    if (leafTags.has(tag) && (!el.children || el.children.length === 0)) return true;
-
-    // Классовые паттерны иконок
-    const classList = el.classList ? [...el.classList] : [];
-    if (classList.some(c => /^fa($|-)/.test(c) || c.includes('icon') || c.startsWith('mdi-') || c.startsWith('bi-'))) {
-      return true;
-    }
-
-    // Мелкие инлайн элементы без детей
-    try {
-      const cs = window.getComputedStyle(el);
-      const interactiveBlockers = new Set(['a','button','input','select','textarea','label']);
-      if (
-        cs && (cs.display === 'inline' || cs.display === 'inline-block') &&
-        (!el.children || el.children.length === 0) &&
-        !interactiveBlockers.has(tag)
-      ) {
-        const rect = el.getBoundingClientRect();
-        if (rect.width <= 40 && rect.height <= 40) return true;
+    // Обрабатываем все найденные тексты
+    for (const text of texts) {
+      if (!isGoodTextForContains(text)) continue;
+      const escapedText = text.replace(/'/g, "\\'");
+      
+      // ПРИНЦИП: ВСЕГДА используем уникальный контекст для cy.get().contains()
+      // Ищем уникальные предки для комбинации get().contains()
+      let p = el.parentElement, depth = 0;
+      while (p && depth < 4) { // Увеличиваем глубину поиска
+        // Проверяем ID предка (высший приоритет)
+        if (p.id) {
+          const parentSel = `#${esc(p.id)}`;
+          if (document.querySelectorAll(parentSel).length === 1) {
+            if (isUniqueByTextInParent(el, text, p)) {
+              if (__dompickMode === 'js') {
+                out.push({ sel: buildJsFindInScope(parentSel, '*', text, false), isJs: true });
+              } else {
+                const cmd = `cy.get('${parentSel}').contains('${escapedText}')`;
+                out.push({sel: cmd, isCypress: true});
+              }
+            }
+          }
+        }
+        
+        // Проверяем предпочтительные data-атрибуты предка
+        for (const attr of prefDataAttrs) {
+          const value = p.getAttribute(attr);
+          if (value) {
+            const parentSel = `[${attr}="${esc(value)}"]`;
+            if (document.querySelectorAll(parentSel).length === 1) {
+              if (isUniqueByTextInParent(el, text, p)) {
+                if (__dompickMode === 'js') {
+                  out.push({ sel: buildJsFindInScope(parentSel, '*', text, false), isJs: true });
+                } else {
+                  const cmd = `cy.get('${parentSel}').contains('${escapedText}')`;
+                  out.push({sel: cmd, isCypress: true});
+                }
+              }
+            }
+          }
+        }
+        
+        // Проверяем уникальные классы предка
+        if (p.classList && p.classList.length > 0) {
+          const stableClasses = [...p.classList].filter(c => 
+           c && 
+            !looksDynamic(c) && 
+            !c.startsWith('__dompick') &&
+            c.length > 2
+          );
+// Одиночные классы
+          for (const cls of stableClasses.slice(0, 2)) {
+            const parentSel = `.${esc(cls)}`;
+            if (document.querySelectorAll(parentSel).length === 1) {
+              if (isUniqueByTextInParent(el, text, p)) {
+                if (__dompickMode === 'js') {
+                  out.push({ sel: buildJsFindInScope(parentSel, '*', text, false), isJs: true });
+                } else {
+                  const cmd = `cy.get('${parentSel}').contains('${escapedText}')`;
+                  out.push({sel: cmd, isCypress: true});
+                }
+              }
+            }
+          }
+          
+          // Комбинации классов
+          if (stableClasses.length >= 2) {
+            const parentSel = `.${esc(stableClasses[0])}.${esc(stableClasses[1])}`;
+            if (document.querySelectorAll(parentSel).length === 1) {
+              if (isUniqueByTextInParent(el, text, p)) {
+                if (__dompickMode === 'js') {
+                  out.push({ sel: buildJsFindInScope(parentSel, '*', text, false), isJs: true });
+                } else {
+                  const cmd = `cy.get('${parentSel}').contains('${escapedText}')`;
+                  out.push({sel: cmd, isCypress: true});
+                }
+              }
+            }
+          }
+        }
+        
+        // Семантические контейнеры как контекст
+        const semanticContainers = ['header', 'nav', 'main', 'section', 'article', 'aside', 'footer', 'form'];
+        const parentTag = p.tagName.toLowerCase();
+        if (semanticContainers.includes(parentTag)) {
+          if (isUniqueByTextInParent(el, text, p)) {
+            const sameTagContainers = document.querySelectorAll(parentTag);
+            if (sameTagContainers.length <= 2) { // Только если семантический тег почти уникален
+              if (__dompickMode === 'js') {
+                out.push({ sel: buildJsFindInScope(parentTag, '*', text, false), isJs: true });
+              } else {
+                const cmd = `cy.get('${parentTag}').contains('${escapedText}')`;
+                out.push({sel: cmd, isCypress: true});
+              }
+            }
+          }
+        }
+        
+        p = p.parentElement;
+        depth++;
       }
-    } catch {}
+    }
+    
+    return out;
+  }
+  
+  // --- 5.3: Контекстные и иерархические селекторы ---
+  function uniqueWithinScope(el) {
+    // Собираем уникальные предки (scopes)
+    const scopes = [];
+    let p = el.parentElement, depth = 0;
+    
+    while (p && depth < 5) {
+      if (p.id && !hasDigits(p.id)) {
+        const idSel = `#${esc(p.id)}`;
+        if (document.querySelectorAll(idSel).length === 1) {
+          scopes.push(idSel);
+        }
+      }
+      
+      for (const a of prefDataAttrs) {
+        const v = p.getAttribute(a);
+        if (v) {
+          const ds = `[${a}="${esc(v)}"]`;
+          if (document.querySelectorAll(ds).length === 1) {
+            // Контексты с цифрами оставляем, но понизим их оценку позже
+            scopes.push(ds);
+          }
+        }
+      }
+      
+      p = p.parentElement;
+      depth++;
+    }
+    
+    // Собираем "атрибутные атомы" для элемента
+    const attributeAtoms = [];
+    // Предпочтительные data-атрибуты
+    for (const attr of prefDataAttrs) {
+      const value = el.getAttribute(attr);
+      if (value) {
+        attributeAtoms.push(`[${attr}="${esc(value)}"]`);
+      }
+    }
+    
+    // Любые data-атрибуты
+    if (el.attributes) {
+      for (const {name, value} of el.attributes) {
+        if (name.startsWith('data-') && value && !prefDataAttrs.includes(name)) {
+          attributeAtoms.push(`[${name}="${esc(value)}"]`);
+        }
+      }
+    }
+    
+         // Обычные атрибуты
+     for (const attr of okAttrs) {
+       const value = el.getAttribute(attr);
+       if (value) {
+         attributeAtoms.push(`[${attr}="${esc(value)}"]`);
+       }
+     }
+     
+     // Похожие атрибуты (автообнаружение)
+     const similarAttrs = findSimilarAttrs(el);
+     for (const {name, value} of similarAttrs) {
+       attributeAtoms.push(`[${name}="${esc(value)}"]`);
+     }
+    
+    // Комбинации role + aria-label
+    const role = el.getAttribute('role');
+    const ariaLabel = el.getAttribute('aria-label');
+    if (role && ariaLabel) {
+      attributeAtoms.push(`[role="${esc(role)}"][aria-label="${esc(ariaLabel)}"]`);
+    }
+    
+         // Классы (только нединамические и не служебные)
+     if (el.classList) {
+       const classes = [...el.classList].filter(c => 
+         c && 
+         !looksDynamic(c) && 
+         !c.startsWith('__dompick') // Исключаем служебные классы
+       ).slice(0, 3);
+       for (const cls of classes) {
+         attributeAtoms.push(`.${esc(cls)}`);
+       }
+       // Комбинация двух классов
+       if (classes.length >= 2) {
+         attributeAtoms.push(`.${esc(classes[0])}.${esc(classes[1])}`);
+       }
+     }
+    
+    // Тестируем атомы только в рамках найденных уникальных предков
+    const out = [];
+    const tag = el.tagName.toLowerCase();
+    
+    for (const scope of scopes) {
+      for (const atom of attributeAtoms) {
+        // Тестируем атом как есть (избегаем цифровых контекстов)
+        const selector1 = `${scope} ${atom}`;
+        if (isUnique(selector1, el)) {
+          out.push({sel: selector1, score: /\d/.test(scope) || /\d/.test(atom) ? 80 : 90});
+        }
+        
+        // Тестируем с прямым потомком
+        const selector2 = `${scope} > ${atom}`;
+        if (isUnique(selector2, el)) {
+          out.push({sel: selector2, score: /\d/.test(scope) || /\d/.test(atom) ? 82 : 92});
+        }
+        
+        // Тестируем с тегом + атом
+        const selector3 = `${scope} ${tag}${atom}`;
+        if (isUnique(selector3, el)) {
+          out.push({sel: selector3, score: /\d/.test(scope) || /\d/.test(atom) ? 78 : 88});
+        }
+        
+        // Тестируем с тегом + атом как прямой потомок
+        const selector4 = `${scope} > ${tag}${atom}`;
+        if (isUnique(selector4, el)) {
+          out.push({sel: selector4, score: /\d/.test(scope) || /\d/.test(atom) ? 79 : 89});
+        }
+      }
+      
+      // Если нет атрибутных атомов, используем только тег
+      if (attributeAtoms.length === 0) {
+        const selector5 = `${scope} ${tag}`;
+        if (isUnique(selector5, el)) {
+          out.push({sel: selector5, score: /\d/.test(scope) ? 75 : 85});
+        }
+        
+        const selector6 = `${scope} > ${tag}`;
+        if (isUnique(selector6, el)) {
+          out.push({sel: selector6, score: /\d/.test(scope) ? 77 : 87});
+        }
+      }
+    }
+    
+    return out;
+  }
 
+  // --- 5.4: Позиционные селекторы (nth-child) ---
+  function nthPath(el){
+    const parts=[];
+    let cur=el;
+    let usedStableId = false;
+    while(cur && cur.nodeType===1 && parts.length<8){
+      if(cur.id && !hasDigits(cur.id)){
+        parts.unshift(`#${esc(cur.id)}`);
+        usedStableId = true;
+        break;
+      }
+      const tag=cur.tagName.toLowerCase();
+      const p=cur.parentElement;
+      parts.unshift(tag);
+      cur=p;
+    }
+    const sel=parts.join(' > ');
+    return isUnique(sel,el)?[{sel,score: usedStableId ? 62 : 58}]:[];
+  }
+  
+  // Структурные селекторы с nth-child
+  function byNthChild(el) {
+    const out = [];
+    const parent = el.parentElement;
+    if (!parent) return out;
+    
+    const tag = el.tagName.toLowerCase();
+    const siblings = [...parent.children];
+    const index = siblings.indexOf(el) + 1;
+    
+    // nth-child по позиции среди всех детей
+    const nthChildSel = `${tag}:nth-child(${index})`;
+    if (isUnique(nthChildSel, el)) {
+      out.push({sel: nthChildSel});
+    }
+    
+    // nth-of-type по позиции среди элементов того же типа
+    const sameTypeSiblings = siblings.filter(s => s.tagName === el.tagName);
+    if (sameTypeSiblings.length > 1) {
+      const typeIndex = sameTypeSiblings.indexOf(el) + 1;
+      const nthOfTypeSel = `${tag}:nth-of-type(${typeIndex})`;
+      if (isUnique(nthOfTypeSel, el)) {
+        out.push({sel: nthOfTypeSel});
+      }
+    }
+    
+    // first-child, last-child
+    if (index === 1) {
+      const firstChildSel = `${tag}:first-child`;
+      if (isUnique(firstChildSel, el)) {
+        out.push({sel: firstChildSel});
+      }
+    }
+    
+    if (index === siblings.length) {
+      const lastChildSel = `${tag}:last-child`;
+      if (isUnique(lastChildSel, el)) {
+        out.push({sel: lastChildSel});
+      }
+    }
+    
+    return out;
+  }
+  
+  // Селекторы по родительским элементам с nth-child
+  function byParentWithNth(el) {
+    const out = [];
+    const parent = el.parentElement;
+    if (!parent) return out;
+    
+    const tag = el.tagName.toLowerCase();
+    const siblings = [...parent.children];
+    const index = siblings.indexOf(el) + 1;
+    
+    // Поиск родителей с ID или классами
+    let currentParent = parent;
+    let depth = 0;
+    
+    while (currentParent && depth < 3) {
+      // Родитель с ID
+      if (currentParent.id) {
+        const parentSel = `#${esc(currentParent.id)}`;
+        const childSel = `${parentSel} > ${tag}:nth-child(${index})`;
+        if (isUnique(childSel, el)) {
+          out.push({sel: childSel});
+        }
+      }
+      
+      // Родитель с классами
+      if (currentParent.classList && currentParent.classList.length > 0) {
+        const classes = [...currentParent.classList].filter(c => 
+          c && 
+          !looksDynamic(c) && 
+          !c.startsWith('__dompick') // Исключаем служебные классы
+        ).slice(0, 2);
+        if (classes.length > 0) {
+          const parentSel = `.${classes.map(c => esc(c)).join('.')}`;
+          const childSel = `${parentSel} > ${tag}:nth-child(${index})`;
+          if (isUnique(childSel, el)) {
+            out.push({sel: childSel});
+          }
+        }
+      }
+      
+      currentParent = currentParent.parentElement;
+      depth++;
+    }
+    
+    return out;
+  }
+  
+  // --- 5.5: XPath селекторы ---
+function __xpathLiteral(value) {
+  const s = String(value);
+  if (!s.includes("'")) return "'" + s + "'";
+  const parts = s.split("'").map(part => "'" + part + "'");
+  return "concat(" + parts.join(", \"'\", ") + ")";
+}
+
+function isUniqueXPath(xpath, el) {
+  try {
+    const doc = el && el.ownerDocument ? el.ownerDocument : document;
+    const result = doc.evaluate(xpath, doc, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+    return result.snapshotLength === 1 && result.snapshotItem(0) === el;
+  } catch {
     return false;
-  };
+  }
+}
 
-  // Конфиг весов (динамическая система рейтинга). Меняйте значения по необходимости.
-  // Пояснения к каждому параметру ниже.
+function buildAbsoluteXPath(node) {
+  if (!node || node.nodeType !== 1) return null;
+  const segments = [];
+  for (let el = node; el && el.nodeType === 1; el = el.parentElement) {
+    let tag = el.tagName.toLowerCase();
+    let index = 1, sameTagCount = 0;
+    if (el.parentElement) {
+      const siblings = el.parentElement.children;
+      for (let i = 0; i < siblings.length; i++) {
+        const sib = siblings[i];
+        if (sib.tagName && sib.tagName.toLowerCase() === tag) {
+          sameTagCount++;
+          if (sib === el) index = sameTagCount;
+        }
+      }
+      if (sameTagCount > 1) tag += `[${index}]`;
+    }
+    segments.unshift(tag);
+  }
+  return '/' + segments.join('/');
+}
+
+function byXPath(el) {
+  const out = [];
+  if (!el || el.nodeType !== 1) return out;
+  const tag = el.tagName.toLowerCase();
+
+  // 1) id
+  if (el.id && el.id.length < 80 && !/%|\/|\s/.test(el.id)) {
+    const lit = __xpathLiteral(el.id);
+    const xp1 = `//*[@id=${lit}]`;
+    if (isUniqueXPath(xp1, el)) out.push({ sel: xp1, isXPath: true });
+    const xp2 = `//${tag}[@id=${lit}]`;
+    if (isUniqueXPath(xp2, el)) out.push({ sel: xp2, isXPath: true });
+  }
+
+  // 2) preferred data-* attributes
+  try {
+    const pref = ['data-testid','data-test','data-cy','data-qa','data-test-id','data-automation-id','for'];
+    for (const a of pref) {
+      const v = el.getAttribute && el.getAttribute(a);
+      if (!v || v.length > 120 || /^\s*$/.test(v)) continue;
+      const lit = __xpathLiteral(v);
+      const xp1 = `//*[@${a}=${lit}]`;
+      if (isUniqueXPath(xp1, el)) out.push({ sel: xp1, isXPath: true });
+      const xp2 = `//${tag}[@${a}=${lit}]`;
+      if (isUniqueXPath(xp2, el)) out.push({ sel: xp2, isXPath: true });
+    }
+  } catch {}
+
+  // 3) role + aria-label
+  const role = el.getAttribute && el.getAttribute('role');
+  const aria = el.getAttribute && el.getAttribute('aria-label');
+  if (role && aria) {
+    const xp = `//${tag}[@role=${__xpathLiteral(role)} and @aria-label=${__xpathLiteral(aria)}]`;
+    if (isUniqueXPath(xp, el)) out.push({ sel: xp, isXPath: true });
+    const xp2 = `//*[@role=${__xpathLiteral(role)} and @aria-label=${__xpathLiteral(aria)}]`;
+    if (isUniqueXPath(xp2, el)) out.push({ sel: xp2, isXPath: true });
+  }
+
+  // 4) другие устойчивые атрибуты
+  for (const a of okAttrs) {
+    const v = el.getAttribute && el.getAttribute(a);
+    if (!v || v.length > 120 || /^\s*$/.test(v)) continue;
+    const lit = __xpathLiteral(v);
+    const xp1 = `//${tag}[@${a}=${lit}]`;
+    if (isUniqueXPath(xp1, el)) out.push({ sel: xp1, isXPath: true });
+  }
+
+  // 5) короткий класс (без цифр) — осторожно
+  if (el.classList && el.classList.length) {
+    for (const c of el.classList) {
+      // Пропускаем классы, добавленные самим скриптом
+      if (c.startsWith('__dompick')) continue;
+      if (!/\d/.test(c) && c.length <= 40) {
+        const xp = `//${tag}[contains(concat(' ', normalize-space(@class), ' '), ' ${c} ')]`;
+        if (isUniqueXPath(xp, el)) out.push({ sel: xp, isXPath: true });
+      }
+    }
+  }
+
+  // 6) контекст от стабильного предка
+  let cur = el.parentElement;
+  while (cur && cur.nodeType === 1) {
+    let base = null;
+    if (cur.id && !/%|\/|\s/.test(cur.id)) {
+      base = `//*[@id=${__xpathLiteral(cur.id)}]`;
+    } else {
+      for (const a of ['data-testid','data-test','data-cy','data-qa','data-test-id','data-automation-id']) {
+        const v = cur.getAttribute && cur.getAttribute(a);
+        if (v && v.length <= 120 && !/^\s*$/.test(v)) { base = `//*[@${a}=${__xpathLiteral(v)}]`; break; }
+      }
+    }
+    if (base) {
+      // позиция текущего узла среди одноимённых детей своего родителя
+      const parent = el.parentElement;
+      let idx = 1, sameTagCount = 0;
+      if (parent) {
+        const kids = parent.children;
+        for (let i = 0; i < kids.length; i++) {
+          if (kids[i].tagName && kids[i].tagName.toLowerCase() === tag) {
+            sameTagCount++;
+            if (kids[i] === el) idx = sameTagCount;
+          }
+        }
+      }
+      const xp = `${base}//${tag}${(sameTagCount > 1) ? `[${idx}]` : ''}`;
+      if (isUniqueXPath(xp, el)) out.push({ sel: xp, isXPath: true });
+    }
+    cur = cur.parentElement;
+  }
+
+  // 7) Абсолютный fallback — всегда уникален
+  if (out.length === 0) {
+    const abs = buildAbsoluteXPath(el);
+    if (abs && isUniqueXPath(abs, el)) {
+      out.push({ sel: abs, isXPath: true });
+    }
+  }
+
+  // дедупликация
+  const seen = new Set();
+  return out.filter(o => !seen.has(o.sel) && (seen.add(o.sel), true));
+}
+
+  // --- 5.5: Стабильные scope селекторы ---
+  // Находит ближайший стабильный предок и его уникальный селектор без цифр
+  function findStableScope(el) {
+    const t0 = performance.now();
+    let current = el.parentElement;
+    let depth = 0;
+    while (current && depth < 10) {
+      // 1) Предок с ID без цифр
+      if (current.id && !hasDigits(current.id)) {
+        const sel = `#${esc(current.id)}`;
+        if (document.querySelectorAll(sel).length === 1) {
+          const dt = performance.now() - t0;
+          if (__dompickConfig.debug) __perfStats.misc.findStableScope.push(dt);
+          return { scopeEl: current, scopeSelector: sel };
+        }
+      }
+
+      // 2) Предпочтительные data-атрибуты без цифр
+      for (const a of prefDataAttrs) {
+        const v = current.getAttribute && current.getAttribute(a);
+        if (!v || hasDigits(v)) continue;
+        const sel = `[${a}="${esc(v)}"]`;
+        if (document.querySelectorAll(sel).length === 1) {
+          const dt = performance.now() - t0;
+          if (__dompickConfig.debug) __perfStats.misc.findStableScope.push(dt);
+          return { scopeEl: current, scopeSelector: sel };
+        }
+      }
+
+      // 3) Уникальные стабильные классы без цифр
+      if (current.classList && current.classList.length > 0) {
+        const stable = [...current.classList].filter(c => c && !looksDynamic(c) && !hasDigits(c) && !c.startsWith('__dompick'));
+        for (const cls of stable.slice(0, 2)) {
+          const sel = `.${esc(cls)}`;
+          if (document.querySelectorAll(sel).length === 1) {
+            const dt = performance.now() - t0;
+            if (__dompickConfig.debug) __perfStats.misc.findStableScope.push(dt);
+            return { scopeEl: current, scopeSelector: sel };
+          }
+        }
+      }
+
+      current = current.parentElement;
+      depth++;
+    }
+    const dt = performance.now() - t0;
+    if (__dompickConfig.debug) __perfStats.misc.findStableScope.push(dt);
+    return null;
+  }
+
+  // Строит кратчайший позиционный путь от предка до элемента вида tag(>tag:nth-of-type(k))
+  function buildMinimalPathFromAncestor(el, ancestorEl) {
+    const parts = [];
+    let current = el;
+    while (current && current !== ancestorEl) {
+      const parent = current.parentElement;
+      if (!parent) break;
+      const tag = current.tagName.toLowerCase();
+      const sameTagSiblings = [...parent.children].filter(c => c.tagName.toLowerCase() === tag);
+      const index = sameTagSiblings.indexOf(current);
+      const part = sameTagSiblings.length === 1 || index < 0 ? tag : `${tag}:nth-of-type(${index + 1})`;
+      parts.unshift(part);
+      current = parent;
+    }
+    return parts.join(' > ');
+  }
+
+  // Генерирует селекторы: стабильный предок (без цифр) + минимальный позиционный путь до элемента
+  function byStableScopePath(el) {
+    const out = [];
+    const found = __timeit('findStableScope', () => findStableScope(el));
+    if (!found) return out;
+    const { scopeEl, scopeSelector } = found;
+    const path = buildMinimalPathFromAncestor(el, scopeEl);
+    if (!path) return out;
+
+    const directSel = `${scopeSelector} > ${path}`;
+    if (isUnique(directSel, el)) out.push({ sel: directSel });
+
+    const descSel = `${scopeSelector} ${path}`;
+    if (isUnique(descSel, el)) out.push({ sel: descSel });
+
+    // Попробуем упростить путь, заменив хвост на стабильный класс/тег,
+    // например: '#student-next-lesson span.empty'
+    const targetClassList = el.classList ? [...el.classList] : [];
+    const stableClass = targetClassList.find(c => c && !looksDynamic(c) && !hasDigits(c) && !c.startsWith('__dompick'));
+    if (stableClass) {
+      const shortSel1 = `${scopeSelector} .${esc(stableClass)}`;
+      if (isUnique(shortSel1, el)) out.push({ sel: shortSel1 });
+      const tag = el.tagName.toLowerCase();
+      const shortSel2 = `${scopeSelector} ${tag}.${esc(stableClass)}`;
+      if (isUnique(shortSel2, el)) out.push({ sel: shortSel2 });
+    }
+    // Вариант по тегу, если класс не подходит
+    const tag = el.tagName.toLowerCase();
+    const tagSel = `${scopeSelector} ${tag}`;
+    if (isUnique(tagSel, el)) out.push({ sel: tagSel });
+
+    return out;
+  }
+  
+  // --- 5.6: Агрессивные и Fallback стратегии ---
+  // Комбинированные селекторы с соседними элементами
+  function bySiblingSelectors(el) {
+    const out = [];
+    const parent = el.parentElement;
+    if (!parent) return out;
+    
+    const tag = el.tagName.toLowerCase();
+    const siblings = [...parent.children];
+    const index = siblings.indexOf(el);
+
+    // Селектор через предыдущий соседний элемент
+    if (index > 0) {
+      const prevSibling = siblings[index - 1];
+      if (prevSibling.id) {
+        const siblingId = `#${esc(prevSibling.id)}`;
+        const adjacentSel = `${siblingId} + ${tag}`;
+        if (isUnique(adjacentSel, el)) {
+          out.push({sel: adjacentSel});
+        }
+      }
+      
+      if (prevSibling.classList && prevSibling.classList.length > 0) {
+        const classes = [...prevSibling.classList].filter(c => 
+          c && 
+          !looksDynamic(c) && 
+          !c.startsWith('__dompick') // Исключаем служебные классы
+        ).slice(0, 1);
+        if (classes.length > 0) {
+          const siblingClass = `.${esc(classes[0])}`;
+          const adjacentSel = `${siblingClass} + ${tag}`;
+          if (isUnique(adjacentSel, el)) {
+            out.push({sel: adjacentSel});
+          }
+        }
+      }
+    }
+    
+    return out;
+  }
+  
+  // Специальные селекторы для календарей и подобных компонентов
+  function byCalendarSelectors(el) {
+    const out = [];
+    const tag = el.tagName.toLowerCase();
+    const text = el.textContent?.trim();
+    
+    // СТРОГАЯ проверка, что это именно элемент календаря
+    const datepickerContainer = el.closest('.datepicker');
+    const calendarContainer = el.closest('[class*="calendar"]');
+    const dateContainer = el.closest('[class*="date"]');
+    
+    // Проверяем только если элемент ДЕЙСТВИТЕЛЬНО в календаре
+    if (!datepickerContainer && !calendarContainer && !dateContainer) {
+      return out;
+    }
+    
+    // Дополнительная проверка для td - должен быть в календарной таблице
+    if (tag === 'td') {
+      const table = el.closest('table');
+      if (!table) return out;
+      
+      // Проверяем, что таблица содержит календарные элементы
+      const hasCalendarClasses = table.querySelector('.day, .today, .active, .month, .year');
+      if (!hasCalendarClasses) return out;
+    }
+    
+    // Селекторы только для datepicker календарей
+    if (datepickerContainer && tag === 'td' && text && /^\d+$/.test(text)) {
+      const dayNumber = text;
+      // Проверяем, что .datepicker действительно существует в документе
+      if (document.querySelector('.datepicker')) {
+        // Поиск по тексту в видимом календаре - с проверкой
+        const visibleCalendarSel = `cy.get('.datepicker').filter(':visible').contains('${dayNumber}')`;
+
+        // Проверяем, что этот селектор действительно найдет наш элемент
+        const testElements = document.querySelectorAll('.datepicker');
+        let foundInDatepicker = false;
+        for (const dp of testElements) {
+          if (dp.contains(el)) {
+            foundInDatepicker = true;
+            break;
+          }
+        }
+        
+        if (foundInDatepicker) {
+          out.push({sel: visibleCalendarSel, isCypress: true});
+          // Поиск в datepicker-days только если такой элемент существует
+          if (document.querySelector('.datepicker-days')) {
+            const activeDaysSel = `cy.get('.datepicker-days:visible td').contains('${dayNumber}')`;
+            out.push({sel: activeDaysSel, isCypress: true});
+          }
+        }
+      }
+      
+      // Селекторы относительно today элемента - только если today существует
+      const todayElement = datepickerContainer.querySelector('td.today');
+      if (todayElement) {
+        const allDays = [...datepickerContainer.querySelectorAll('td.day, td.today, td.active')];
+        const todayIndex = allDays.indexOf(todayElement);
+        const currentIndex = allDays.indexOf(el);
+        
+        if (todayIndex >= 0 && currentIndex >= 0) {
+          const diff = currentIndex - todayIndex;
+          if (diff !== 0) {
+            const relativeSel = diff > 0 
+              ? `cy.get('.datepicker').filter(':visible').find('td.today').nextAll('td').eq(${diff - 1})`
+              : `cy.get('.datepicker').filter(':visible').find('td.today').prevAll('td').eq(${Math.abs(diff) - 1})`;
+            out.push({sel: relativeSel, isCypress: true});
+          }
+        }
+      }
+    }
+    
+    return out;
+  }
+  
+  // Агрессивные fallback селекторы для крайних случаев
+  function generateAggressiveFallbacks(el) {
+    const out = [];
+    const tag = el.tagName.toLowerCase();
+    
+    // 1. Селекторы с уникальными родителями + nth-child
+    const parentWithNthSelectors = generateParentNthSelectors(el);
+    out.push(...parentWithNthSelectors);
+
+    // 2. Селекторы по позиции в документе (только если уникальные)
+    const allSameTagElements = document.querySelectorAll(tag);
+    const elementIndex = [...allSameTagElements].indexOf(el);
+    if (elementIndex >= 0) {
+      const nthSel = `${tag}:nth-of-type(${elementIndex + 1})`;
+      if (isUnique(nthSel, el)) {
+        out.push({sel: nthSel});
+      }
+    }
+    
+    // 3. Селектор по тексту для JS-режима: выбираем ближайший визуально подходящий узел
+    const textContent = el.textContent?.trim();
+    if (textContent && textContent.length > 0 && textContent.length < 50) {
+      const sample = textContent.length > 25 ? textContent.substring(0, 25) : textContent;
+      if (__dompickMode === 'js') {
+        const jsExpr = buildJsFindInScope(null, '*', sample, false);
+        out.push({ sel: jsExpr, __targetEl: el });
+      } else {
+        const partialText = sample;
+        if (partialText.length > 2) {
+          const uniqueContext = findMinimalUniqueContext(el, partialText);
+          if (uniqueContext) {
+            const contextContainsSel = `cy.get('${uniqueContext}').contains('${partialText.replace(/'/g, "\\'")}')`;
+            out.push({sel: contextContainsSel, isCypress: true});
+          } else if (isUniqueByText(el, partialText)) {
+            const containsSel = `cy.contains('${partialText.replace(/'/g, "\\'")}')`;
+            out.push({sel: containsSel, isCypress: true});
+          }
+        }
+      }
+    }
+    
+    // 4. Селекторы по атрибутам (только уникальные)
+    if (el.attributes) {
+      for (const {name, value} of el.attributes) {
+        if (name && value && value.length < 50 && !looksDynamic(value)) {
+          // Фильтруем системные классы DOM Picker'а
+          if (name === 'class' && value.includes('__dompick')) continue;
+          
+          const attrSel = `[${name}="${esc(value)}"]`;
+          if (isUnique(attrSel, el)) {
+            out.push({sel: attrSel});
+          }
+          
+          const tagAttrSel = `${tag}[${name}="${esc(value)}"]`;
+          if (isUnique(tagAttrSel, el)) {
+            out.push({sel: tagAttrSel});
+          }
+        }
+      }
+    }
+    
+    // 5. Селекторы по классам (только стабильные и уникальные)
+    if (el.classList && el.classList.length > 0) {
+      const stableClasses = [...el.classList].filter(c => 
+        c && 
+        !looksDynamic(c) && 
+        !c.startsWith('__dompick') && // Исключаем наши служебные классы
+        c.length > 1
+      );
+      
+      for (const cls of stableClasses.slice(0, 3)) {
+        const classSel = `.${esc(cls)}`;
+        if (isUnique(classSel, el)) {
+          out.push({sel: classSel});
+        }
+        
+        const tagClassSel = `${tag}.${esc(cls)}`;
+        if (isUnique(tagClassSel, el)) {
+          out.push({sel: tagClassSel});
+        }
+      }
+    }
+    
+    // 6. Простой селектор по тегу только если он уникален
+    if (isUnique(tag, el)) {
+      out.push({sel: tag});
+    }
+    
+    // 7. Минимальный уникальный позиционный селектор (короткий суффикс абсолютного пути)
+    const minimalPositional = buildMinimalPositionalSelector(el);
+    if (minimalPositional) {
+      out.push({ sel: minimalPositional });
+    }
+    
+    // 8. Абсолютный CSS-путь (как самый низкоприоритетный запасной вариант)
+    out.push({ sel: buildAbsoluteCssPath(el) });
+    return out;
+  }
+
+  // Супер-агрессивные fallback селекторы для экстремальных случаев
+  function generateSuperAggressiveFallbacks(el) {
+    const out = [];
+    const tag = el.tagName.toLowerCase();
+    
+    // 1. Глубокие nth-child цепочки
+    const deepNthSelectors = generateDeepNthSelectors(el);
+    out.push(...deepNthSelectors);
+
+    // 2. Селекторы через соседние элементы
+    const siblingSelectors = generateAdvancedSiblingSelectors(el);
+    out.push(...siblingSelectors);
+
+    // 3. Комбинированные селекторы с частичными атрибутами
+    const partialAttrSelectors = generatePartialAttributeSelectors(el);
+    out.push(...partialAttrSelectors);
+
+    // 4. Селекторы по псевдо-классам
+    const pseudoSelectors = generatePseudoClassSelectors(el);
+    out.push(...pseudoSelectors);
+
+    // 5. Относительные Cypress селекторы
+    const relativeCypressSelectors = generateRelativeCypressSelectors(el);
+    out.push(...relativeCypressSelectors);
+    
+    return out;
+  }
+  
+  // =========================================================================
+  // РАЗДЕЛ 6: АНАЛИЗ И ОЦЕНКА СЕЛЕКТОРОВ (СКОРИНГ)
+  // =========================================================================
+  
+  // --- Конфигурация весов для оценки селекторов ---
+  // Определяет "ценность" различных частей селектора для вычисления его итогового рейтинга.
   const selectorWeights = {
     // anchor_type: базовая «опорная» надёжность якоря селектора
     // data-testid / data-qa: специальные тестовые атрибуты почти всегда стабильны
@@ -1369,7 +2884,41 @@ function makeDraggable(targetEl, handleEl, options = {}) {
     bonus_simple_tag_class: 12,          // tag.class
   };
 
-  // --- Утилиты анализа селектора ---
+  // --- Главная функция оценки селектора ---
+  function computeSelectorScore(item, targetEl){
+    const sel = item.isCypress ? item.sel : item.sel; // одинаково, item.sel всегда строка
+    let score = 0;
+
+    // Бонусы якорей
+    score += anchorTypeBonuses(sel, targetEl);
+    // Штрафы/бонусы
+    score += positionalPenalty(sel);
+    score += absolutePathPenalty(sel);
+    score += digitsRatioPenalty(sel);
+    score += depthPenalty(sel);
+    score += complexityPenalty(sel);
+    score += attributeTokenPenalty(sel);
+    score += elementRefsPenalty(sel);
+    score += textRiskPenalty(sel);
+    score += containerQualityBonus(sel);
+    score += visibilityContextBonus(sel);
+    score += actionFitScore(sel, targetEl);
+    score += fallbackResilienceBonus(sel);
+
+    // Штраф за комбинатор '+' (зависимость от соседей)
+    if (/\+/.test(sel)) score += selectorWeights.penalty_combinator_plus;
+
+    // Преференс простым уникальным классам и tag.class
+    try {
+      const onlyClass = /^\.[a-zA-Z_-][a-zA-Z0-9_-]*$/.test(sel) && !/\d/.test(sel);
+      if (onlyClass) score += selectorWeights.bonus_simple_unique_class;
+      const tagClass = /^[a-z][a-z0-9-]*\.[a-zA-Z_-][a-zA-Z0-9_-]*$/.test(sel) && !/\d/.test(sel);
+      if (tagClass) score += selectorWeights.bonus_simple_tag_class;
+    } catch {}
+    return score;
+  }
+  
+  // --- Функции-анализаторы для скоринга ---
   const isCypressSelector = (item) => !!item.isCypress || /\bcy\./.test(item.sel);
   const includesContains = (s) => /\.contains\(/.test(s) || /cy\.contains\(/.test(s);
   const extractGetScope = (s) => {
@@ -1384,7 +2933,7 @@ function makeDraggable(targetEl, handleEl, options = {}) {
     return { idTokens, classTokens, attrTokens };
   };
   const elementRefCount = (s) => {
-    // Считаем число сегментов-элементов, разделённых комбинаторами пробел/>, +, ~
+    // Считает число сегментов-элементов, разделённых комбинаторами пробел/>, +, ~
     // Убираем лишние пробелы и служебные конструкции внутри []
     const parts = s
       .replace(/\[[^\]]+\]/g, '[]')
@@ -1497,7 +3046,7 @@ function makeDraggable(targetEl, handleEl, options = {}) {
     if (/\[[^\]]+\]/.test(sel)) {
       return selectorWeights.penalty_attr_clickable;
     }
-    return selectorWeights.penalty_action_poor;
+     return selectorWeights.penalty_action_poor;
   };
   const fallbackResilienceBonus = (sel) => {
     if (isAbsolutePathLike(sel)) return selectorWeights.bonus_fallback_low; // слабый
@@ -1523,358 +3072,7 @@ function makeDraggable(targetEl, handleEl, options = {}) {
     return extra * selectorWeights.penalty_per_element_ref_after1;
   };
 
-  function computeSelectorScore(item, targetEl){
-    const sel = item.isCypress ? item.sel : item.sel; // одинаково, item.sel всегда строка
-    let score = 0;
-    // Бонусы якорей
-    score += anchorTypeBonuses(sel, targetEl);
-    // Штрафы/бонусы
-    score += positionalPenalty(sel);
-    score += absolutePathPenalty(sel);
-    score += digitsRatioPenalty(sel);
-    score += depthPenalty(sel);
-    score += complexityPenalty(sel);
-    score += attributeTokenPenalty(sel);
-    score += elementRefsPenalty(sel);
-    score += textRiskPenalty(sel);
-    score += containerQualityBonus(sel);
-    score += visibilityContextBonus(sel);
-    score += actionFitScore(sel, targetEl);
-    score += fallbackResilienceBonus(sel);
-    // Штраф за комбинатор '+' (зависимость от соседей)
-    if (/\+/.test(sel)) score += selectorWeights.penalty_combinator_plus;
-
-    // Преференс простым уникальным классам и tag.class
-    try {
-      const onlyClass = /^\.[a-zA-Z_-][a-zA-Z0-9_-]*$/.test(sel) && !/\d/.test(sel);
-      if (onlyClass) score += selectorWeights.bonus_simple_unique_class;
-      const tagClass = /^[a-z][a-z0-9-]*\.[a-zA-Z_-][a-zA-Z0-9_-]*$/.test(sel) && !/\d/.test(sel);
-      if (tagClass) score += selectorWeights.bonus_simple_tag_class;
-    } catch {}
-    return score;
-  }
-
-  // ==== Быстродействие: общий тайм-бюджет и кэш запросов ====
-  let __buildBudgetEnd = 0; // timestamp (performance.now) когда прекращаем дорогие операции
-  const __queryCache = new Map(); // selector -> Array<Element>
-  const budgetExpired = () => __buildBudgetEnd > 0 && performance.now() > __buildBudgetEnd;
-  const resetPerfGuards = () => {
-    __buildBudgetEnd = 0;
-    __queryCache.clear();
-    // сброс профайла между запусками генерации
-    if (__dompickConfig.debug) {
-      __perfStats.strategies = Object.create(null);
-      __perfStats.isUnique.length = 0;
-      __perfStats.misc.getAllTexts.length = 0;
-      __perfStats.misc.findStableScope.length = 0;
-      __perfStats.totals = { isUniqueCalls: 0, isUniqueMisses: 0, isUniqueHits: 0, qsaTimeMs: 0 };
-    }
-  };
-
-  const isUnique = (selector, el) => { // :contentReference[oaicite:5]{index=5}
-    try {
-      let list = __queryCache.get(selector);
-      if (!list) {
-        // Кэшируем результаты querySelectorAll для повтора в рамках одной генерации
-        const t0 = performance.now();
-        list = Array.from(document.querySelectorAll(selector));
-        const dt = performance.now() - t0;
-        if (__dompickConfig.debug) {
-          __perfStats.totals.isUniqueMisses++;
-          __perfStats.totals.qsaTimeMs += dt;
-          if (dt > __dompickConfig.slowQueryThresholdMs) {
-            __perfStats.isUnique.push({ sel: selector, ms: +dt.toFixed(1), count: list.length, cached: false });
-          }
-        }
-        __queryCache.set(selector, list);
-      } else if (__dompickConfig.debug) {
-        __perfStats.totals.isUniqueHits++;
-        __perfStats.isUnique.push({ sel: selector, ms: 0, count: list.length, cached: true });
-      }
-      if (__dompickConfig.debug) __perfStats.totals.isUniqueCalls++;
-      return list.length === 1 && list[0] === el;
-    } catch { return false; }
-  };
-
-
-// === XPath helpers ===
-function __xpathLiteral(value) {
-  const s = String(value);
-  if (!s.includes("'")) return "'" + s + "'";
-  const parts = s.split("'").map(part => "'" + part + "'");
-  return "concat(" + parts.join(", \"'\", ") + ")";
-}
-
-function isUniqueXPath(xpath, el) {
-  try {
-    const doc = el && el.ownerDocument ? el.ownerDocument : document;
-    const result = doc.evaluate(xpath, doc, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-    return result.snapshotLength === 1 && result.snapshotItem(0) === el;
-  } catch {
-    return false;
-  }
-}
-
-function buildAbsoluteXPath(node) {
-  if (!node || node.nodeType !== 1) return null;
-  const segments = [];
-  for (let el = node; el && el.nodeType === 1; el = el.parentElement) {
-    let tag = el.tagName.toLowerCase();
-    let index = 1, sameTagCount = 0;
-    if (el.parentElement) {
-      const siblings = el.parentElement.children;
-      for (let i = 0; i < siblings.length; i++) {
-        const sib = siblings[i];
-        if (sib.tagName && sib.tagName.toLowerCase() === tag) {
-          sameTagCount++;
-          if (sib === el) index = sameTagCount;
-        }
-      }
-      if (sameTagCount > 1) tag += `[${index}]`;
-    }
-    segments.unshift(tag);
-  }
-  return '/' + segments.join('/');
-}
-
-function byXPath(el) {
-  const out = [];
-  if (!el || el.nodeType !== 1) return out;
-  const tag = el.tagName.toLowerCase();
-
-  // 1) id
-  if (el.id && el.id.length < 80 && !/%|\/|\s/.test(el.id)) {
-    const lit = __xpathLiteral(el.id);
-    const xp1 = `//*[@id=${lit}]`;
-    if (isUniqueXPath(xp1, el)) out.push({ sel: xp1, isXPath: true });
-    const xp2 = `//${tag}[@id=${lit}]`;
-    if (isUniqueXPath(xp2, el)) out.push({ sel: xp2, isXPath: true });
-  }
-
-  // 2) preferred data-* attributes
-  try {
-    const pref = ['data-testid','data-test','data-cy','data-qa','data-test-id','data-automation-id','for'];
-    for (const a of pref) {
-      const v = el.getAttribute && el.getAttribute(a);
-      if (!v || v.length > 120 || /^\s*$/.test(v)) continue;
-      const lit = __xpathLiteral(v);
-      const xp1 = `//*[@${a}=${lit}]`;
-      if (isUniqueXPath(xp1, el)) out.push({ sel: xp1, isXPath: true });
-      const xp2 = `//${tag}[@${a}=${lit}]`;
-      if (isUniqueXPath(xp2, el)) out.push({ sel: xp2, isXPath: true });
-    }
-  } catch {}
-
-  // 3) role + aria-label
-  const role = el.getAttribute && el.getAttribute('role');
-  const aria = el.getAttribute && el.getAttribute('aria-label');
-  if (role && aria) {
-    const xp = `//${tag}[@role=${__xpathLiteral(role)} and @aria-label=${__xpathLiteral(aria)}]`;
-    if (isUniqueXPath(xp, el)) out.push({ sel: xp, isXPath: true });
-    const xp2 = `//*[@role=${__xpathLiteral(role)} and @aria-label=${__xpathLiteral(aria)}]`;
-    if (isUniqueXPath(xp2, el)) out.push({ sel: xp2, isXPath: true });
-  }
-
-  // 4) другие устойчивые атрибуты
-  const okAttrs = ['name','type','placeholder','href','value','title'];
-  for (const a of okAttrs) {
-    const v = el.getAttribute && el.getAttribute(a);
-    if (!v || v.length > 120 || /^\s*$/.test(v)) continue;
-    const lit = __xpathLiteral(v);
-    const xp1 = `//${tag}[@${a}=${lit}]`;
-    if (isUniqueXPath(xp1, el)) out.push({ sel: xp1, isXPath: true });
-  }
-
-  // 5) короткий класс (без цифр) — осторожно
-  if (el.classList && el.classList.length) {
-    for (const c of el.classList) {
-      // Пропускаем классы, добавленные самим скриптом
-      if (c.startsWith('__dompick')) continue;
-      if (!/\d/.test(c) && c.length <= 40) {
-        const xp = `//${tag}[contains(concat(' ', normalize-space(@class), ' '), ' ${c} ')]`;
-        if (isUniqueXPath(xp, el)) out.push({ sel: xp, isXPath: true });
-      }
-    }
-  }
-
-  // 6) контекст от стабильного предка
-  let cur = el.parentElement;
-  while (cur && cur.nodeType === 1) {
-    let base = null;
-    if (cur.id && !/%|\/|\s/.test(cur.id)) {
-      base = `//*[@id=${__xpathLiteral(cur.id)}]`;
-    } else {
-      for (const a of ['data-testid','data-test','data-cy','data-qa','data-test-id','data-automation-id']) {
-        const v = cur.getAttribute && cur.getAttribute(a);
-        if (v && v.length <= 120 && !/^\s*$/.test(v)) { base = `//*[@${a}=${__xpathLiteral(v)}]`; break; }
-      }
-    }
-    if (base) {
-      // позиция текущего узла среди одноимённых детей своего родителя
-      const parent = el.parentElement;
-      let idx = 1, sameTagCount = 0;
-      if (parent) {
-        const kids = parent.children;
-        for (let i = 0; i < kids.length; i++) {
-          if (kids[i].tagName && kids[i].tagName.toLowerCase() === tag) {
-            sameTagCount++;
-            if (kids[i] === el) idx = sameTagCount;
-          }
-        }
-      }
-      const xp = `${base}//${tag}${(sameTagCount > 1) ? `[${idx}]` : ''}`;
-      if (isUniqueXPath(xp, el)) out.push({ sel: xp, isXPath: true });
-    }
-    cur = cur.parentElement;
-  }
-
-  // 7) Абсолютный fallback — всегда уникален
-  if (out.length === 0) {
-    const abs = buildAbsoluteXPath(el);
-    if (abs && isUniqueXPath(abs, el)) {
-      out.push({ sel: abs, isXPath: true });
-    }
-  }
-
-  // дедупликация
-  const seen = new Set();
-  return out.filter(o => !seen.has(o.sel) && (seen.add(o.sel), true));
-}
-
-  
-  // Функция для обнаружения похожих атрибутов
-  const findSimilarAttrs = (el) => {
-    const similarAttrs = [];
-    if (!el.attributes) return similarAttrs;
-    
-    for (const {name, value} of el.attributes) {
-      if (!value || value.trim() === '') continue;
-      
-      // Пропускаем уже известные атрибуты
-      if (prefDataAttrs.includes(name) || okAttrs.includes(name)) continue;
-      
-      // Ищем атрибуты, которые выглядят как уникальные идентификаторы
-      const valueStr = value.toString();
-      
-      // Проверяем, что значение не слишком длинное и не слишком короткое
-      if (valueStr.length < 2 || valueStr.length > 50) continue;
-      
-      // Пропускаем динамические значения
-      if (looksDynamic(valueStr)) continue;
-      
-      // Проверяем, что значение содержит буквы (не только цифры)
-      if (!/[a-zA-Z]/.test(valueStr)) continue;
-      
-      // Проверяем, что атрибут уникален в документе
-      const selector = `[${name}="${esc(valueStr)}"]`;
-      if (isUnique(selector, el)) {
-        similarAttrs.push({name, value: valueStr});
-      }
-    }
-    
-    return similarAttrs;
-  };
-
-  // Находит ближайший стабильный предок и его уникальный селектор без цифр
-  function findStableScope(el) { // может быть дорогим на глубоком DOM
-    const t0 = performance.now();
-    let current = el.parentElement;
-    let depth = 0;
-    while (current && depth < 10) {
-      // 1) Предок с ID без цифр
-      if (current.id && !hasDigits(current.id)) {
-        const sel = `#${esc(current.id)}`;
-        if (document.querySelectorAll(sel).length === 1) {
-          const dt = performance.now() - t0;
-          if (__dompickConfig.debug) __perfStats.misc.findStableScope.push(dt);
-          return { scopeEl: current, scopeSelector: sel };
-        }
-      }
-
-      // 2) Предпочтительные data-атрибуты без цифр
-      for (const a of prefDataAttrs) {
-        const v = current.getAttribute && current.getAttribute(a);
-        if (!v || hasDigits(v)) continue;
-        const sel = `[${a}="${esc(v)}"]`;
-        if (document.querySelectorAll(sel).length === 1) {
-          const dt = performance.now() - t0;
-          if (__dompickConfig.debug) __perfStats.misc.findStableScope.push(dt);
-          return { scopeEl: current, scopeSelector: sel };
-        }
-      }
-
-      // 3) Уникальные стабильные классы без цифр
-      if (current.classList && current.classList.length > 0) {
-        const stable = [...current.classList].filter(c => c && !looksDynamic(c) && !hasDigits(c) && !c.startsWith('__dompick'));
-        for (const cls of stable.slice(0, 2)) {
-          const sel = `.${esc(cls)}`;
-          if (document.querySelectorAll(sel).length === 1) {
-            const dt = performance.now() - t0;
-            if (__dompickConfig.debug) __perfStats.misc.findStableScope.push(dt);
-            return { scopeEl: current, scopeSelector: sel };
-          }
-        }
-      }
-
-      current = current.parentElement;
-      depth++;
-    }
-    const dt = performance.now() - t0;
-    if (__dompickConfig.debug) __perfStats.misc.findStableScope.push(dt);
-    return null;
-  }
-
-  // Строит кратчайший позиционный путь от предка до элемента вида tag(>tag:nth-of-type(k))
-  function buildMinimalPathFromAncestor(el, ancestorEl) {
-    const parts = [];
-    let current = el;
-    while (current && current !== ancestorEl) {
-      const parent = current.parentElement;
-      if (!parent) break;
-      const tag = current.tagName.toLowerCase();
-      const sameTagSiblings = [...parent.children].filter(c => c.tagName.toLowerCase() === tag);
-      const index = sameTagSiblings.indexOf(current);
-      const part = sameTagSiblings.length === 1 || index < 0 ? tag : `${tag}:nth-of-type(${index + 1})`;
-      parts.unshift(part);
-      current = parent;
-    }
-    return parts.join(' > ');
-  }
-
-  // Генерирует селекторы: стабильный предок (без цифр) + минимальный позиционный путь до элемента
-  function byStableScopePath(el) { // :contentReference[oaicite:6]{index=6}
-    const out = [];
-    const found = __timeit('findStableScope', () => findStableScope(el));
-    if (!found) return out;
-    const { scopeEl, scopeSelector } = found;
-    const path = buildMinimalPathFromAncestor(el, scopeEl);
-    if (!path) return out;
-
-    const directSel = `${scopeSelector} > ${path}`;
-    if (isUnique(directSel, el)) out.push({ sel: directSel });
-
-    const descSel = `${scopeSelector} ${path}`;
-    if (isUnique(descSel, el)) out.push({ sel: descSel });
-
-    // Попробуем упростить путь, заменив хвост на стабильный класс/тег,
-    // например: '#student-next-lesson span.empty'
-    const targetClassList = el.classList ? [...el.classList] : [];
-    const stableClass = targetClassList.find(c => c && !looksDynamic(c) && !hasDigits(c) && !c.startsWith('__dompick'));
-    if (stableClass) {
-      const shortSel1 = `${scopeSelector} .${esc(stableClass)}`;
-      if (isUnique(shortSel1, el)) out.push({ sel: shortSel1 });
-      const tag = el.tagName.toLowerCase();
-      const shortSel2 = `${scopeSelector} ${tag}.${esc(stableClass)}`;
-      if (isUnique(shortSel2, el)) out.push({ sel: shortSel2 });
-    }
-    // Вариант по тегу, если класс не подходит
-    const tag = el.tagName.toLowerCase();
-    const tagSel = `${scopeSelector} ${tag}`;
-    if (isUnique(tagSel, el)) out.push({ sel: tagSel });
-
-    return out;
-  }
-
+  // --- Утилиты для работы с текстом ---
   // Функция для извлечения текста из элемента
   const getElementText = (el) => {
     if (!el) return '';
@@ -1914,7 +3112,7 @@ function byXPath(el) {
   };
 
   // Функция для получения всех возможных текстов из элемента и его детей
-  const getAllTexts = (el) => { // возможный «тяжёлый» обход дочерних элементов
+  const getAllTexts = (el) => {
     const t0_all = performance.now();
     const texts = [];
     
@@ -2012,85 +3210,19 @@ function byXPath(el) {
     } catch { return false; }
   };
 
-  // Поиск минимального уникального контекста для cy.contains()
-  const findMinimalUniqueContext = (el, text) => {
-    let currentParent = el.parentElement;
-    let depth = 0;
-    const maxDepth = 5;
-    
-    while (currentParent && depth < maxDepth) {
-      // Проверяем ID родителя
-      if (currentParent.id) {
-        const contextSelector = `#${esc(currentParent.id)}`;
-        if (document.querySelectorAll(contextSelector).length === 1) {
-          if (isUniqueByTextInParent(el, text, currentParent)) {
-            return contextSelector;
-          }
-        }
-      }
-      
-      // Проверяем предпочтительные data-атрибуты
-      for (const attr of prefDataAttrs) {
-        const value = currentParent.getAttribute(attr);
-        if (value) {
-          const contextSelector = `[${attr}="${esc(value)}"]`;
-          if (document.querySelectorAll(contextSelector).length === 1) {
-            if (isUniqueByTextInParent(el, text, currentParent)) {
-              return contextSelector;
-            }
-          }
-        }
-      }
-      
-      // Проверяем уникальные классы
-      if (currentParent.classList && currentParent.classList.length > 0) {
-        const stableClasses = [...currentParent.classList].filter(c => 
-          c && 
-          !looksDynamic(c) && 
-          !c.startsWith('__dompick') &&
-          c.length > 2
-        );
-        
-        for (const cls of stableClasses.slice(0, 2)) {
-          const contextSelector = `.${esc(cls)}`;
-          if (document.querySelectorAll(contextSelector).length === 1) {
-            if (isUniqueByTextInParent(el, text, currentParent)) {
-              return contextSelector;
-            }
-          }
-        }
-        
-        // Комбинация из двух классов
-        if (stableClasses.length >= 2) {
-          const contextSelector = `.${esc(stableClasses[0])}.${esc(stableClasses[1])}`;
-          if (document.querySelectorAll(contextSelector).length === 1) {
-            if (isUniqueByTextInParent(el, text, currentParent)) {
-              return contextSelector;
-            }
-          }
-        }
-      }
-      
-      // Проверяем семантические контейнеры
-      const semanticContainers = ['header', 'nav', 'main', 'section', 'article', 'aside', 'footer', 'form'];
-      const parentTag = currentParent.tagName.toLowerCase();
-      if (semanticContainers.includes(parentTag)) {
-        if (isUniqueByTextInParent(el, text, currentParent)) {
-          // Дополнительно проверяем, что такой семантический контейнер уникален или почти уникален
-          const sameTagContainers = document.querySelectorAll(parentTag);
-          if (sameTagContainers.length <= 3) {
-            return parentTag;
-          }
-        }
-      }
-      
-      currentParent = currentParent.parentElement;
-      depth++;
-    }
-    
-    return null;
-  };
+  // Построение JS-поиска по тексту в (необязательном) scope
+  function buildJsFindInScope(scopeSelector, tagOrStar, text, visibleOnly){
+    const safeScope = String(scopeSelector || '')
+      .replace(/\\/g, "\\\\")
+      .replace(/'/g, "\\'");
+    const txt = String(text).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const safeTag = String(tagOrStar || '*').replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const base = scopeSelector ? `(document.querySelector('${safeScope}')||document)` : 'document';
+    const iife = `(()=>{ const baseEl=${base}; const list=Array.from(baseEl.querySelectorAll('${safeTag}')); let cand=list.filter(el=>el&&el.textContent&&el.textContent.includes('${txt}')); ${visibleOnly ? "cand=cand.filter(el=>el&&el.offsetParent!==null);" : ''} if(!cand.length) return null; const depth=(n)=>{let d=0; for(let p=n; p; p=p.parentElement) d++; return d;}; cand.sort((a,b)=>{ const da=depth(a), db=depth(b); if(da!==db) return db-da; const ra=a.getBoundingClientRect(), rb=b.getBoundingClientRect(); const aa=(ra.width||0)*(ra.height||0), ab=(rb.width||0)*(rb.height||0); return aa-ab; }); return cand[0]; })()`;
+    return iife;
+  }
 
+  // --- Валидаторы селекторов ---
   // Валидация Cypress селектора - проверяет, что селектор действительно найдет нужный элемент
   const validateCypressSelector = (selector, targetElement) => {
     try {
@@ -2122,7 +3254,6 @@ function byXPath(el) {
             for (const container of containers) {
               if (container.contains(targetElement)) {
                 foundInContainer = true;
-                
                 // КРИТИЧНО: проверяем уникальность текста в этом контейнере
                 if (!isUniqueByTextInParent(targetElement, text, container)) {
                   isUniqueInContainer = false;
@@ -2235,7 +3366,7 @@ function byXPath(el) {
           return tagDescendants.length === 1 && tagDescendants[0] === targetElement;
         }
       }
-      
+       
       if (selector.includes('.next()')) {
         const nextElement = baseElement.nextElementSibling;
         return nextElement === targetElement;
@@ -2247,7 +3378,7 @@ function byXPath(el) {
       }
       
       if (selector.includes('.nextAll()')) {
-        // Простой nextAll()
+         // Простой nextAll()
         if (selector.match(/\.nextAll\(\)$/)) {
           const nextElements = [];
           let current = baseElement.nextElementSibling;
@@ -2309,7 +3440,7 @@ function byXPath(el) {
           let current = baseElement.parentElement;
           while (current) {
             if (current.tagName.toLowerCase() === tag && current === targetElement) {
-              return true;
+               return true;
             }
             current = current.parentElement;
           }
@@ -2323,1831 +3454,215 @@ function byXPath(el) {
     }
   };
 
-  // Поднимаемся к «осмысленной» цели
-  function snapTarget(el){
-    const originalEl = el; // Сохраняем исходный элемент
-    // Если исходный элемент несёт осмысленный текст — считаем его целевым,
-    // чтобы не подниматься до родителя с цифровым ID
+  // =========================================================================
+  // РАЗДЕЛ 7: ВСПОМОГАТЕЛЬНЫЕ УТИЛИТЫ
+  // =========================================================================
+
+  // --- 7.1: Утилиты для производительности ---
+  const budgetExpired = () => __buildBudgetEnd > 0 && performance.now() > __buildBudgetEnd;
+  const resetPerfGuards = () => {
+    __buildBudgetEnd = 0;
+    __queryCache.clear();
+    // сброс профайла между запусками генерации
+    if (__dompickConfig.debug) {
+      __perfStats.strategies = Object.create(null);
+      __perfStats.isUnique.length = 0;
+      __perfStats.misc.getAllTexts.length = 0;
+      __perfStats.misc.findStableScope.length = 0;
+      __perfStats.totals = { isUniqueCalls: 0, isUniqueMisses: 0, isUniqueHits: 0, qsaTimeMs: 0 };
+    }
+  };
+
+  const isUnique = (selector, el) => { // :contentReference{index=5}
     try {
-      const origText = getElementText(originalEl);
-      if (isGoodTextForContains(origText)) {
-        return originalEl;
+      let list = __queryCache.get(selector);
+      if (!list) {
+        // Кэшируем результаты querySelectorAll для повтора в рамках одной генерации
+        const t0 = performance.now();
+        list = Array.from(document.querySelectorAll(selector));
+        const dt = performance.now() - t0;
+        if (__dompickConfig.debug) {
+          __perfStats.totals.isUniqueMisses++;
+          __perfStats.totals.qsaTimeMs += dt;
+          if (dt > __dompickConfig.slowQueryThresholdMs) {
+            __perfStats.isUnique.push({ sel: selector, ms: +dt.toFixed(1), count: list.length, cached: false });
+          }
+        }
+        __queryCache.set(selector, list);
+      } else if (__dompickConfig.debug) {
+        __perfStats.totals.isUniqueHits++;
+        __perfStats.isUnique.push({ sel: selector, ms: 0, count: list.length, cached: true });
+      }
+      if (__dompickConfig.debug) __perfStats.totals.isUniqueCalls++;
+      return list.length === 1 && list[0] === el;
+    } catch { return false; }
+  };
+
+  function __timeit(name, fn) {
+    const t0 = performance.now();
+    const res = fn();
+    const dt = performance.now() - t0;
+    if (__dompickConfig.debug) {
+      (__perfStats.strategies[name] || (__perfStats.strategies[name] = [])).push(dt);
+      if (dt > __dompickConfig.slowQueryThresholdMs) {
+        __dlog('info', `⚠️ медленная стратегия ${name}: ${dt.toFixed(1)}ms`);
+      }
+    }
+    return res;
+  }
+
+  // --- 7.2: Утилиты для отладки ---
+  function __dlog(level, ...args) {
+    if (!__dompickConfig.debug) return;
+    const ok = __dompickConfig.logLevel === 'trace' || level !== 'trace';
+    if (ok) console.log('[DOMPick]', ...args);
+  }
+
+  function __dumpPerfSummary(ctx, groups) {
+    if (!__dompickConfig.debug) return;
+    const lastRun = __perfStats.buildRuns[__perfStats.buildRuns.length - 1];
+    console.groupCollapsed(`🧪 DOMPick Perf (${ctx}) · ${lastRun?.ms?.toFixed?.(1)}ms`);
+    if (groups) {
+      console.log('Counts:', {
+        basic: groups.basicSelectors?.length, contains: groups.containsSelectors?.length,
+        nth: groups.nthSelectors?.length, aggressive: (groups.aggressive?.length || 0)
+      });
+    }
+    console.log('isUnique:', __perfStats.totals, 'samples:', __perfStats.isUnique.length);
+    const stratAvg = Object.fromEntries(Object.entries(__perfStats.strategies).map(([k, arr]) => {
+      const sum = arr.reduce((a,b)=>a+b,0); return [k, { calls: arr.length, avgMs: +(sum/arr.length).toFixed(2), sumMs: +sum.toFixed(1) }];
+    }));
+    console.table(stratAvg);
+    if (__perfStats.isUnique.length) {
+      console.table(__perfStats.isUnique.slice(0, 20));
+    }
+    console.groupEnd();
+  }
+
+  // --- 7.3: Общие DOM-утилиты ---
+  const clearNode = (el) => { while (el.firstChild) el.removeChild(el.firstChild); };
+  const esc = (s) => CSS.escape(s);
+  const looksDynamic = (s='') => /\b\d{4,}\b|\b[a-f0-9]{6,}\b|__/i.test(s);
+  const hasDigits = (s='') => /\d/.test(s);
+  
+  // Вспомогательные константы для селекторов
+  const prefDataAttrs = ['data-testid','data-test','data-cy','data-qa','data-test-id','data-automation-id','for'];
+  const okAttrs = ['id','name','type','placeholder','href','value','role','aria-label','title','for'];
+  const interestingSel = 'button, a, input, select, textarea, label, [role="button"], [role="menuitem"], .select2-container, .select2-choice, .select2-selection, .select2-selection__rendered, .select2-drop, .select2-results, .select2-result, .select2-result-label, .select2-results__option, .select2-input';
+
+  // Утилиты для гейтинга стратегий
+  function __canRun(name, weight = 1) {
+    if (budgetExpired()) {
+      __dlog('info', `⏰ ${name}: пропуск (бюджет истёк)`);
+      return false;
+    }
+    const remaining = __buildBudgetEnd - performance.now();
+    if (remaining < __dompickConfig.strategyBudgetMs * weight) {
+      __dlog('info', `⏰ ${name}: пропуск (остаток ${remaining.toFixed(0)}ms < ${__dompickConfig.strategyBudgetMs * weight}ms)`);
+      return false;
+    }
+    return true;
+  }
+
+  function __countDescendants(el, cap = 5000) {
+    let count = 0;
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_ELEMENT, null, false);
+    while (walker.nextNode() && count < cap) count++;
+    return count;
+  }
+  
+  // Эвристика: «листовой» инлайн-элемент, который следует оставлять как есть (не подниматься к родителю)
+  const isLeafInlineElement = (el) => {
+    if (!el || el.nodeType !== 1) return false;
+    const tag = el.tagName ? el.tagName.toLowerCase() : '';
+    // Явные «иконко-подобные» и мелкие инлайны
+    const leafTags = new Set(['i','svg','img','use','path','picture','source','sup','sub','b','strong','em','small','span']);
+    if (leafTags.has(tag) && (!el.children || el.children.length === 0)) return true;
+
+    // Классовые паттерны иконок
+    const classList = el.classList ? [...el.classList] : [];
+    if (classList.some(c => /^fa($|-)/.test(c) || c.includes('icon') || c.startsWith('mdi-') || c.startsWith('bi-'))) {
+      return true;
+    }
+
+    // Мелкие инлайн элементы без детей
+    try {
+      const cs = window.getComputedStyle(el);
+      const interactiveBlockers = new Set(['a','button','input','select','textarea','label']);
+      if (
+        cs && (cs.display === 'inline' || cs.display === 'inline-block') &&
+        (!el.children || el.children.length === 0) &&
+        !interactiveBlockers.has(tag)
+      ) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width <= 40 && rect.height <= 40) return true;
       }
     } catch {}
-    // Если навели на «листовой» инлайн-элемент (иконка, одиночный span и т.п.) — не поднимаемся
-    if (isLeafInlineElement(originalEl)) {
-      return originalEl;
-    }
 
-    let cur = el, depth = 0;
-    
-    while (cur && depth < 6){
-      if (cur.matches && (cur.matches(interestingSel) || cur.id || cur.getAttribute && prefDataAttrs.some(a=>cur.getAttribute(a)))) {
-        // Если исходный элемент содержит хороший текст, сохраняем ссылку на него
-        const originalText = getElementText(originalEl);
-        if (isGoodTextForContains(originalText)) {
-          cur._originalTextElement = originalEl;
-        }
-        return cur;
-      }
-      cur = cur.parentElement; 
-      depth++;
-    }
-    return el;
-  }
+    return false;
+  };
 
-  // ==== Стратегии генерации (как в предыдущей версии) ====
-  function byId(el){
-    if (!el.id) return [];
-    const id = el.id;
-    const sel = `#${esc(id)}`;
-    if (!isUnique(sel, el)) return [];
-    // Если ID содержит цифры — исключаем из базовых: вернётся позже через uniqueWithinScope/агрессивные
-    if (hasDigits(id)) return [];
-    return [{ sel }];
-  }
-  function byPreferredData(el){
-    const out=[];
-    for(const a of prefDataAttrs){
-      const v=el.getAttribute&&el.getAttribute(a);
-      if(!v) continue;
-      const s=`[${a}="${esc(v)}"]`;
-      if(isUnique(s,el)) out.push({sel:s,score: hasDigits(v) ? 0 : 95});
-      const s2=`${el.tagName.toLowerCase()}${s}`;
-      if(isUnique(s2,el)) out.push({sel:s2,score: hasDigits(v) ? 0 : 93});
-    }
-    return out;
-  }
-  function byAnyData(el){
-    const out=[];
-    if(!el.attributes) return out;
-    for(const {name,value} of el.attributes){
-      if(!name.startsWith('data-')||!value) continue;
-      const s=`[${name}="${esc(value)}"]`;
-      if(isUnique(s,el)) out.push({sel:s,score: hasDigits(value) ? 0 : 85});
-      const s2=`${el.tagName.toLowerCase()}${s}`;
-      if(isUnique(s2,el)) out.push({sel:s2,score: hasDigits(value) ? 0 : 83});
-    }
-    return out;
-  }
-  function byAttr(el){
-    const out=[];
-    for(const a of okAttrs){
-      const v=el.getAttribute&&el.getAttribute(a);
-      if(!v) continue;
-      const s=`[${a}="${esc(v)}"]`;
-      if(isUnique(s,el)) out.push({sel:s,score: hasDigits(v) ? 0 : 80});
-      const s2=`${el.tagName.toLowerCase()}${s}`;
-      if(isUnique(s2,el)) out.push({sel:s2,score: hasDigits(v) ? 0 : 78});
-    }
-    const role=el.getAttribute&&el.getAttribute('role');
-    const al=el.getAttribute&&el.getAttribute('aria-label');
-    if(role&&al){
-      const s=`[role="${esc(role)}"][aria-label="${esc(al)}"]`;
-      if(isUnique(s,el)) out.push({sel:s,score: hasDigits(role)||hasDigits(al) ? 0 : 82});
-    }
-    return out;
-  }
-  function byClassCombos(el){ 
-    const out=[]; 
-    const classes=el.classList ? [...el.classList].filter(c => 
-      c && 
-      !looksDynamic(c) && 
-      !c.startsWith('__dompick') // Исключаем служебные классы DOM Picker'а
-    ).slice(0,4) : []; 
-    
-    for(const c of classes){ 
-      const s=`.${esc(c)}`; 
-      if(isUnique(s,el)) out.push({sel:s,score: hasDigits(c) ? 0 : 70}); 
-      const s2=`${el.tagName.toLowerCase()}${s}`; 
-      if(isUnique(s2,el)) out.push({sel:s2,score: hasDigits(c) ? 0 : 72}); 
-    } 
-    
-    if(classes.length>=2){ 
-      const [a,b]=classes; 
-      const s=`.${esc(a)}.${esc(b)}`; 
-      if(isUnique(s,el)) out.push({sel:s,score: (hasDigits(a)||hasDigits(b)) ? 0 : 73}); 
-      const s2=`${el.tagName.toLowerCase()}${s}`; 
-      if(isUnique(s2,el)) out.push({sel:s2,score: (hasDigits(a)||hasDigits(b)) ? 0 : 74}); 
-    } 
-    
-    return out; 
-  }
-  function bySimilarAttrs(el){ const out=[]; const similarAttrs=findSimilarAttrs(el); for(const {name,value} of similarAttrs){ const s=`[${name}="${esc(value)}"]`; if(isUnique(s,el)) out.push({sel:s}); const s2=`${el.tagName.toLowerCase()}[${name}="${esc(value)}"]`; if(isUnique(s2,el)) out.push({sel:s2}); } return out; }
-
-  // Построение JS-поиска по тексту в (необязательном) scope
-  function buildJsFindInScope(scopeSelector, tagOrStar, text, visibleOnly){
-    const safeScope = String(scopeSelector || '')
-      .replace(/\\/g, "\\\\")
-      .replace(/'/g, "\\'");
-    const txt = String(text).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-    const safeTag = String(tagOrStar || '*').replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-    const base = scopeSelector ? `(document.querySelector('${safeScope}')||document)` : 'document';
-    const iife = `(()=>{ const baseEl=${base}; const list=Array.from(baseEl.querySelectorAll('${safeTag}')); let cand=list.filter(el=>el&&el.textContent&&el.textContent.includes('${txt}')); ${visibleOnly ? "cand=cand.filter(el=>el&&el.offsetParent!==null);" : ''} if(!cand.length) return null; const depth=(n)=>{let d=0; for(let p=n; p; p=p.parentElement) d++; return d;}; cand.sort((a,b)=>{ const da=depth(a), db=depth(b); if(da!==db) return db-da; const ra=a.getBoundingClientRect(), rb=b.getBoundingClientRect(); const aa=(ra.width||0)*(ra.height||0), ab=(rb.width||0)*(rb.height||0); return aa-ab; }); return cand[0]; })()`;
-    return iife;
-  }
-
-  // Генерация команд по тексту
-  function byCypressText(el) {
-    const out = [];
-    const texts = getAllTexts(el);
+  // Определяет все возможные действия для элемента
+  const getAvailableActions = (el) => {
     const tag = el.tagName.toLowerCase();
-    
-    // Обрабатываем все найденные тексты
-    for (const text of texts) {
-      if (!isGoodTextForContains(text)) continue;
-      
-      const escapedText = text.replace(/'/g, "\\'");
-      
-      if (__dompickMode === 'js') {
-        // Глобально уникальный текст
-        if (isUniqueByText(el, text)) {
-          out.push({ sel: buildJsFindInScope(null, '*', text, false), isJs: true });
-        }
-        // Уникален среди тега
-        if (isUniqueByText(el, text, tag)) {
-          out.push({ sel: buildJsFindInScope(null, tag, text, false), isJs: true });
-        }
-        // Специальные контейнеры (видимый)
-        const specialContainer = el.closest('.datepicker, .modal, .modal-body, .modal-content, .modal-dialog, .dropdown, .popup, .overlay, .sidebar, .panel');
-        if (specialContainer) {
-          const containerClass = specialContainer.classList[0];
-          if (containerClass && isUniqueByTextInParent(el, text, specialContainer)) {
-            out.push({ sel: buildJsFindInScope(`.${containerClass}`, '*', text, true), isJs: true });
-          }
-        }
-        // Уникальный контекст
-        if (!isUniqueByText(el, text)) {
-          const uniqueContext = findMinimalUniqueContext(el, text);
-          if (uniqueContext) {
-            out.push({ sel: buildJsFindInScope(uniqueContext, '*', text, false), isJs: true });
-          }
-        }
+    const type = el.type ? el.type.toLowerCase() : '';
+    const actions = [];
+    if (tag === 'input') {
+      if (type === 'text' || type === 'email' || type === 'password' || type === 'search' || type === 'url' || type === 'tel') {
+        actions.push('type', 'click', 'clear');
+      } else if (type === 'checkbox' || type === 'radio') {
+        actions.push('check', 'uncheck', 'click');
+      } else if (type === 'submit' || type === 'button') {
+        actions.push('click');
       } else {
-        // Режим Cypress
-        if (isUniqueByText(el, text)) {
-          const containsCmd = `cy.contains('${escapedText}')`;
-          out.push({sel: containsCmd, isCypress: true});
-        }
-        if (isUniqueByText(el, text, tag)) {
-          const containsWithTagCmd = `cy.contains('${tag}', '${escapedText}')`;
-          out.push({sel: containsWithTagCmd, isCypress: true});
-        }
-        const specialContainer = el.closest('.datepicker, .modal, .modal-body, .modal-content, .modal-dialog, .dropdown, .popup, .overlay, .sidebar, .panel');
-        if (specialContainer) {
-          const containerClass = specialContainer.classList[0];
-          if (containerClass && isUniqueByTextInParent(el, text, specialContainer)) {
-            const visibleContainsCmd = `cy.get('.${containerClass}').filter(':visible').contains('${escapedText}')`;
-            out.push({sel: visibleContainsCmd, isCypress: true});
-          }
-        }
-        if (!isUniqueByText(el, text)) {
-          const uniqueContext = findMinimalUniqueContext(el, text);
-          if (uniqueContext) {
-            const contextContainsCmd = `cy.get('${uniqueContext}').contains('${escapedText}')`;
-            out.push({sel: contextContainsCmd, isCypress: true});
-          }
-        }
+        actions.push('click');
       }
-    }
-    
-    return out;
-  }
-  
-  // Генерация комбинированных Cypress команд (селектор + текст)
-  function byCypressCombo(el) {
-    const out = [];
-    const texts = getAllTexts(el);
-    
-    // Обрабатываем все найденные тексты
-    for (const text of texts) {
-      if (!isGoodTextForContains(text)) continue;
-      
-      const escapedText = text.replace(/'/g, "\\'");
-      
-      // ПРИНЦИП: ВСЕГДА используем уникальный контекст для cy.get().contains()
-      // Ищем уникальные предки для комбинации get().contains()
-      let p = el.parentElement, depth = 0;
-      
-      while (p && depth < 4) { // Увеличиваем глубину поиска
-        // Проверяем ID предка (высший приоритет)
-        if (p.id) {
-          const parentSel = `#${esc(p.id)}`;
-          if (document.querySelectorAll(parentSel).length === 1) {
-            if (isUniqueByTextInParent(el, text, p)) {
-              if (__dompickMode === 'js') {
-                out.push({ sel: buildJsFindInScope(parentSel, '*', text, false), isJs: true });
-              } else {
-                const cmd = `cy.get('${parentSel}').contains('${escapedText}')`;
-                out.push({sel: cmd, isCypress: true});
-              }
-            }
-          }
-        }
-        
-        // Проверяем предпочтительные data-атрибуты предка
-        for (const attr of prefDataAttrs) {
-          const value = p.getAttribute(attr);
-          if (value) {
-            const parentSel = `[${attr}="${esc(value)}"]`;
-            if (document.querySelectorAll(parentSel).length === 1) {
-              if (isUniqueByTextInParent(el, text, p)) {
-                if (__dompickMode === 'js') {
-                  out.push({ sel: buildJsFindInScope(parentSel, '*', text, false), isJs: true });
-                } else {
-                  const cmd = `cy.get('${parentSel}').contains('${escapedText}')`;
-                  out.push({sel: cmd, isCypress: true});
-                }
-              }
-            }
-          }
-        }
-        
-        // Проверяем уникальные классы предка
-        if (p.classList && p.classList.length > 0) {
-          const stableClasses = [...p.classList].filter(c => 
-            c && 
-            !looksDynamic(c) && 
-            !c.startsWith('__dompick') &&
-            c.length > 2
-          );
-          
-          // Одиночные классы
-          for (const cls of stableClasses.slice(0, 2)) {
-            const parentSel = `.${esc(cls)}`;
-            if (document.querySelectorAll(parentSel).length === 1) {
-              if (isUniqueByTextInParent(el, text, p)) {
-                if (__dompickMode === 'js') {
-                  out.push({ sel: buildJsFindInScope(parentSel, '*', text, false), isJs: true });
-                } else {
-                  const cmd = `cy.get('${parentSel}').contains('${escapedText}')`;
-                  out.push({sel: cmd, isCypress: true});
-                }
-              }
-            }
-          }
-          
-          // Комбинации классов
-          if (stableClasses.length >= 2) {
-            const parentSel = `.${esc(stableClasses[0])}.${esc(stableClasses[1])}`;
-            if (document.querySelectorAll(parentSel).length === 1) {
-              if (isUniqueByTextInParent(el, text, p)) {
-                if (__dompickMode === 'js') {
-                  out.push({ sel: buildJsFindInScope(parentSel, '*', text, false), isJs: true });
-                } else {
-                  const cmd = `cy.get('${parentSel}').contains('${escapedText}')`;
-                  out.push({sel: cmd, isCypress: true});
-                }
-              }
-            }
-          }
-        }
-        
-        // Семантические контейнеры как контекст
-        const semanticContainers = ['header', 'nav', 'main', 'section', 'article', 'aside', 'footer', 'form'];
-        const parentTag = p.tagName.toLowerCase();
-        if (semanticContainers.includes(parentTag)) {
-          if (isUniqueByTextInParent(el, text, p)) {
-            const sameTagContainers = document.querySelectorAll(parentTag);
-            if (sameTagContainers.length <= 2) { // Только если семантический тег почти уникален
-              if (__dompickMode === 'js') {
-                out.push({ sel: buildJsFindInScope(parentTag, '*', text, false), isJs: true });
-              } else {
-                const cmd = `cy.get('${parentTag}').contains('${escapedText}')`;
-                out.push({sel: cmd, isCypress: true});
-              }
-            }
-          }
-        }
-        
-        p = p.parentElement;
-        depth++;
-      }
-    }
-    
-    return out;
-  }
-  function uniqueWithinScope(el) {
-    // Собираем уникальные предки (scopes)
-    const scopes = [];
-    let p = el.parentElement, depth = 0;
-    
-    while (p && depth < 5) {
-      if (p.id && !hasDigits(p.id)) {
-        const idSel = `#${esc(p.id)}`;
-        if (document.querySelectorAll(idSel).length === 1) {
-          scopes.push(idSel);
-        }
-      }
-      
-      for (const a of prefDataAttrs) {
-        const v = p.getAttribute(a);
-        if (v) {
-          const ds = `[${a}="${esc(v)}"]`;
-          if (document.querySelectorAll(ds).length === 1) {
-            // Контексты с цифрами оставляем, но понизим их оценку позже
-            scopes.push(ds);
-          }
-        }
-      }
-      
-      p = p.parentElement;
-      depth++;
-    }
-    
-    // Собираем "атрибутные атомы" для элемента
-    const attributeAtoms = [];
-    
-    // Предпочтительные data-атрибуты
-    for (const attr of prefDataAttrs) {
-      const value = el.getAttribute(attr);
-      if (value) {
-        attributeAtoms.push(`[${attr}="${esc(value)}"]`);
-      }
-    }
-    
-    // Любые data-атрибуты
-    if (el.attributes) {
-      for (const {name, value} of el.attributes) {
-        if (name.startsWith('data-') && value && !prefDataAttrs.includes(name)) {
-          attributeAtoms.push(`[${name}="${esc(value)}"]`);
-        }
-      }
-    }
-    
-         // Обычные атрибуты
-     for (const attr of okAttrs) {
-       const value = el.getAttribute(attr);
-       if (value) {
-         attributeAtoms.push(`[${attr}="${esc(value)}"]`);
-       }
-     }
-     
-     // Похожие атрибуты (автообнаружение)
-     const similarAttrs = findSimilarAttrs(el);
-     for (const {name, value} of similarAttrs) {
-       attributeAtoms.push(`[${name}="${esc(value)}"]`);
-     }
-    
-    // Комбинации role + aria-label
-    const role = el.getAttribute('role');
-    const ariaLabel = el.getAttribute('aria-label');
-    if (role && ariaLabel) {
-      attributeAtoms.push(`[role="${esc(role)}"][aria-label="${esc(ariaLabel)}"]`);
-    }
-    
-         // Классы (только нединамические и не служебные)
-     if (el.classList) {
-       const classes = [...el.classList].filter(c => 
-         c && 
-         !looksDynamic(c) && 
-         !c.startsWith('__dompick') // Исключаем служебные классы
-       ).slice(0, 3);
-       
-       for (const cls of classes) {
-         attributeAtoms.push(`.${esc(cls)}`);
-       }
-       // Комбинация двух классов
-       if (classes.length >= 2) {
-         attributeAtoms.push(`.${esc(classes[0])}.${esc(classes[1])}`);
-       }
-     }
-    
-    // Тестируем атомы только в рамках найденных уникальных предков
-    const out = [];
-    const tag = el.tagName.toLowerCase();
-    
-    for (const scope of scopes) {
-      for (const atom of attributeAtoms) {
-        // Тестируем атом как есть (избегаем цифровых контекстов)
-        const selector1 = `${scope} ${atom}`;
-        if (isUnique(selector1, el)) {
-          out.push({sel: selector1, score: /\d/.test(scope) || /\d/.test(atom) ? 80 : 90});
-        }
-        
-        // Тестируем с прямым потомком
-        const selector2 = `${scope} > ${atom}`;
-        if (isUnique(selector2, el)) {
-          out.push({sel: selector2, score: /\d/.test(scope) || /\d/.test(atom) ? 82 : 92});
-        }
-        
-        // Тестируем с тегом + атом
-        const selector3 = `${scope} ${tag}${atom}`;
-        if (isUnique(selector3, el)) {
-          out.push({sel: selector3, score: /\d/.test(scope) || /\d/.test(atom) ? 78 : 88});
-        }
-        
-        // Тестируем с тегом + атом как прямой потомок
-        const selector4 = `${scope} > ${tag}${atom}`;
-        if (isUnique(selector4, el)) {
-          out.push({sel: selector4, score: /\d/.test(scope) || /\d/.test(atom) ? 79 : 89});
-        }
-      }
-      
-      // Если нет атрибутных атомов, используем только тег
-      if (attributeAtoms.length === 0) {
-        const selector5 = `${scope} ${tag}`;
-        if (isUnique(selector5, el)) {
-          out.push({sel: selector5, score: /\d/.test(scope) ? 75 : 85});
-        }
-        
-        const selector6 = `${scope} > ${tag}`;
-        if (isUnique(selector6, el)) {
-          out.push({sel: selector6, score: /\d/.test(scope) ? 77 : 87});
-        }
-      }
-    }
-    
-    return out;
-  }
-  function nthPath(el){
-    const parts=[];
-    let cur=el;
-    let usedStableId = false;
-    while(cur && cur.nodeType===1 && parts.length<8){
-      if(cur.id && !hasDigits(cur.id)){
-        parts.unshift(`#${esc(cur.id)}`);
-        usedStableId = true;
-        break;
-      }
-      const tag=cur.tagName.toLowerCase();
-      const p=cur.parentElement;
-      parts.unshift(tag);
-      cur=p;
-    }
-    const sel=parts.join(' > ');
-    return isUnique(sel,el)?[{sel,score: usedStableId ? 62 : 58}]:[];
-  }
-  
-  // Структурные селекторы с nth-child
-  function byNthChild(el) {
-    const out = [];
-    const parent = el.parentElement;
-    if (!parent) return out;
-    
-    const tag = el.tagName.toLowerCase();
-    const siblings = [...parent.children];
-    const index = siblings.indexOf(el) + 1;
-    
-    // nth-child по позиции среди всех детей
-    const nthChildSel = `${tag}:nth-child(${index})`;
-    if (isUnique(nthChildSel, el)) {
-      out.push({sel: nthChildSel});
-    }
-    
-    // nth-of-type по позиции среди элементов того же типа
-    const sameTypeSiblings = siblings.filter(s => s.tagName === el.tagName);
-    if (sameTypeSiblings.length > 1) {
-      const typeIndex = sameTypeSiblings.indexOf(el) + 1;
-      const nthOfTypeSel = `${tag}:nth-of-type(${typeIndex})`;
-      if (isUnique(nthOfTypeSel, el)) {
-        out.push({sel: nthOfTypeSel});
-      }
-    }
-    
-    // first-child, last-child
-    if (index === 1) {
-      const firstChildSel = `${tag}:first-child`;
-      if (isUnique(firstChildSel, el)) {
-        out.push({sel: firstChildSel});
-      }
-    }
-    
-    if (index === siblings.length) {
-      const lastChildSel = `${tag}:last-child`;
-      if (isUnique(lastChildSel, el)) {
-        out.push({sel: lastChildSel});
-      }
-    }
-    
-    return out;
-  }
-  
-  // Селекторы по родительским элементам с nth-child
-  function byParentWithNth(el) {
-    const out = [];
-    const parent = el.parentElement;
-    if (!parent) return out;
-    
-    const tag = el.tagName.toLowerCase();
-    const siblings = [...parent.children];
-    const index = siblings.indexOf(el) + 1;
-    
-    // Поиск родителей с ID или классами
-    let currentParent = parent;
-    let depth = 0;
-    
-    while (currentParent && depth < 3) {
-      // Родитель с ID
-      if (currentParent.id) {
-        const parentSel = `#${esc(currentParent.id)}`;
-        const childSel = `${parentSel} > ${tag}:nth-child(${index})`;
-        if (isUnique(childSel, el)) {
-          out.push({sel: childSel});
-        }
-      }
-      
-      // Родитель с классами
-      if (currentParent.classList && currentParent.classList.length > 0) {
-        const classes = [...currentParent.classList].filter(c => 
-          c && 
-          !looksDynamic(c) && 
-          !c.startsWith('__dompick') // Исключаем служебные классы
-        ).slice(0, 2);
-        
-        if (classes.length > 0) {
-          const parentSel = `.${classes.map(c => esc(c)).join('.')}`;
-          const childSel = `${parentSel} > ${tag}:nth-child(${index})`;
-          if (isUnique(childSel, el)) {
-            out.push({sel: childSel});
-          }
-        }
-      }
-      
-      currentParent = currentParent.parentElement;
-      depth++;
-    }
-    
-    return out;
-  }
-  
-  // Комбинированные селекторы с соседними элементами
-  function bySiblingSelectors(el) {
-    const out = [];
-    const parent = el.parentElement;
-    if (!parent) return out;
-    
-    const tag = el.tagName.toLowerCase();
-    const siblings = [...parent.children];
-    const index = siblings.indexOf(el);
-    
-    // Селектор через предыдущий соседний элемент
-    if (index > 0) {
-      const prevSibling = siblings[index - 1];
-      if (prevSibling.id) {
-        const siblingId = `#${esc(prevSibling.id)}`;
-        const adjacentSel = `${siblingId} + ${tag}`;
-        if (isUnique(adjacentSel, el)) {
-          out.push({sel: adjacentSel});
-        }
-      }
-      
-      if (prevSibling.classList && prevSibling.classList.length > 0) {
-        const classes = [...prevSibling.classList].filter(c => 
-          c && 
-          !looksDynamic(c) && 
-          !c.startsWith('__dompick') // Исключаем служебные классы
-        ).slice(0, 1);
-        
-        if (classes.length > 0) {
-          const siblingClass = `.${esc(classes[0])}`;
-          const adjacentSel = `${siblingClass} + ${tag}`;
-          if (isUnique(adjacentSel, el)) {
-            out.push({sel: adjacentSel});
-          }
-        }
-      }
-    }
-    
-    return out;
-  }
-  
-  // Специальные селекторы для календарей и подобных компонентов
-  function byCalendarSelectors(el) {
-    const out = [];
-    const tag = el.tagName.toLowerCase();
-    const text = el.textContent?.trim();
-    
-    // СТРОГАЯ проверка, что это именно элемент календаря
-    const datepickerContainer = el.closest('.datepicker');
-    const calendarContainer = el.closest('[class*="calendar"]');
-    const dateContainer = el.closest('[class*="date"]');
-    
-    // Проверяем только если элемент ДЕЙСТВИТЕЛЬНО в календаре
-    if (!datepickerContainer && !calendarContainer && !dateContainer) {
-      return out;
-    }
-    
-    // Дополнительная проверка для td - должен быть в календарной таблице
-    if (tag === 'td') {
-      const table = el.closest('table');
-      if (!table) return out;
-      
-      // Проверяем, что таблица содержит календарные элементы
-      const hasCalendarClasses = table.querySelector('.day, .today, .active, .month, .year');
-      if (!hasCalendarClasses) return out;
-    }
-    
-    // Селекторы только для datepicker календарей
-    if (datepickerContainer && tag === 'td' && text && /^\d+$/.test(text)) {
-      const dayNumber = text;
-      
-      // Проверяем, что .datepicker действительно существует в документе
-      if (document.querySelector('.datepicker')) {
-        // Поиск по тексту в видимом календаре - с проверкой
-        const visibleCalendarSel = `cy.get('.datepicker').filter(':visible').contains('${dayNumber}')`;
-        // Проверяем, что этот селектор действительно найдет наш элемент
-        const testElements = document.querySelectorAll('.datepicker');
-        let foundInDatepicker = false;
-        for (const dp of testElements) {
-          if (dp.contains(el)) {
-            foundInDatepicker = true;
-            break;
-          }
-        }
-        
-        if (foundInDatepicker) {
-          out.push({sel: visibleCalendarSel, isCypress: true});
-          
-          // Поиск в datepicker-days только если такой элемент существует
-          if (document.querySelector('.datepicker-days')) {
-            const activeDaysSel = `cy.get('.datepicker-days:visible td').contains('${dayNumber}')`;
-            out.push({sel: activeDaysSel, isCypress: true});
-          }
-        }
-      }
-      
-      // Селекторы относительно today элемента - только если today существует
-      const todayElement = datepickerContainer.querySelector('td.today');
-      if (todayElement) {
-        const allDays = [...datepickerContainer.querySelectorAll('td.day, td.today, td.active')];
-        const todayIndex = allDays.indexOf(todayElement);
-        const currentIndex = allDays.indexOf(el);
-        
-        if (todayIndex >= 0 && currentIndex >= 0) {
-          const diff = currentIndex - todayIndex;
-          if (diff !== 0) {
-            const relativeSel = diff > 0 
-              ? `cy.get('.datepicker').filter(':visible').find('td.today').nextAll('td').eq(${diff - 1})`
-              : `cy.get('.datepicker').filter(':visible').find('td.today').prevAll('td').eq(${Math.abs(diff) - 1})`;
-            out.push({sel: relativeSel, isCypress: true});
-          }
-        }
-      }
-    }
-    
-    return out;
-  }
-  
-  function buildCandidates(original) {
-    const el = snapTarget(original);
-    
-    // Собираем все возможные селекторы
-    const allSelectors = collectAllSelectors(el);
-    
-    // Группируем селекторы по типам
-    const groups = categorizeSelectors(allSelectors);
-    
-    return {
-      basicSelectors: groups.basic.slice(0, 3),      // Первые 3 без .contains и nth-child
-      containsSelectors: groups.contains.slice(0, 3), // 4,5,6 с .contains
-      nthSelectors: groups.nth.slice(0, 3),          // 7,8,9 с nth-child
-      xpathSelectors: (groups.xpath || []).slice(0, 3),          // 7,8,9 с nth-child
-      
-      // Резервные селекторы для кнопок "ещё вариантов"
-      moreBasic: groups.basic.slice(3),
-      moreContains: groups.contains.slice(3),
-      moreNth: groups.nth.slice(3),
-      moreXPath: (groups.xpath || []).slice(3),
-      
-      // Дополнительные агрессивные селекторы
-      aggressive: groups.aggressive
-    };
-  }
-
-  // Собираем все возможные селекторы
-  function collectAllSelectors(el) { // :contentReference[oaicite:7]{index=7}
-    const allSelectors = [];
-    const candidatesMap = new Map();
-
-    // Добавляем селекторы порциями, проверяя бюджет
-    const addBatch = (batch) => {
-      for (const item of batch) {
-        if (budgetExpired()) break;
-        if (!candidatesMap.has(item.sel)) {
-          if (item.isCypress) {
-            if (validateCypressSelector(item.sel, el)) {
-              item.__targetEl = el;
-              candidatesMap.set(item.sel, item);
-              allSelectors.push(item);
-            }
-          } else {
-            item.__targetEl = el;
-            candidatesMap.set(item.sel, item);
-            allSelectors.push(item);
-          }
-        }
-      }
-    };
-
-    // 1) Самые быстрые стратегии
-    // Сначала стратегии без цифр (score уже понижен внутри)
-    addBatch(__timeit('byStableScopePath', () => byStableScopePath(el)));
-    addBatch(__timeit('byClassCombos', () => byClassCombos(el)));
-    addBatch(__timeit('byAttr', () => byAttr(el)));
-    addBatch(__timeit('byPreferredData', () => byPreferredData(el)));
-    addBatch(__timeit('byId', () => byId(el)));
-
-    // 2) Остальные базовые
-    addBatch(__timeit('byAnyData', () => byAnyData(el)));
-    addBatch(__timeit('uniqueWithinScope', () => uniqueWithinScope(el)));
-    addBatch(__timeit('nthPath', () => nthPath(el)));
-
-        addBatch(__timeit('byXPath', () => byXPath(el)));
-// Подсчитываем "хорошие" базовые селекторы для гейтинга
-    const goodBasicCount = allSelectors.length;
-    const haveEnoughBasic = goodBasicCount >= __dompickConfig.targetEnoughBasic;
-
-    // 3) Текстовые (дорогие) — гейтим по количеству базовых и размеру DOM
-    if (__dompickConfig.textSearchEnabled && !haveEnoughBasic) {
-      const descendants = __countDescendants(el, __dompickConfig.maxDescendantsForTextSearch + 1);
-      if (descendants <= __dompickConfig.maxDescendantsForTextSearch) {
-        if (__canRun('byCypressText', 2)) {
-          addBatch(__timeit('byCypressText', () => byCypressText(el)));
-        }
-        if (__canRun('byCypressCombo', 2)) {
-          addBatch(__timeit('byCypressCombo', () => byCypressCombo(el)));
-        }
-      } else {
-        __dlog('info', `📝 текстовые стратегии: пропуск (${descendants} потомков > ${__dompickConfig.maxDescendantsForTextSearch})`);
-      }
-    } else if (!__dompickConfig.textSearchEnabled) {
-      __dlog('info', '📝 текстовые стратегии: отключены глобально');
+    } else if (tag === 'select') {
+      actions.push('select', 'click');
+    } else if (tag === 'textarea') {
+      actions.push('type', 'click', 'clear');
+    } else if (tag === 'button' || tag === 'a' || el.getAttribute('role') === 'button') {
+      actions.push('click');
     } else {
-      __dlog('info', `📝 текстовые стратегии: пропуск (достаточно базовых: ${goodBasicCount} >= ${__dompickConfig.targetEnoughBasic})`);
-    }
-
-    // Явный короткий текстовый селектор внутри стабильного scope
-    const scope = __timeit('findStableScope(in-collect)', () => findStableScope(el));
-    if (scope) {
-      const texts = __timeit('getAllTexts(scope-short)', () => getAllTexts(el)).filter(t => isGoodTextForContains(t));
-      const shortText = texts.find(t => t.length <= 25);
-      if (shortText) {
-        if (__dompickMode === 'js') {
-          addBatch([{ sel: buildJsFindInScope(scope.scopeSelector, '*', shortText, false) }]);
-        } else {
-          const escaped = shortText.replace(/'/g, "\\'");
-          const sel1 = `cy.get('${scope.scopeSelector}').contains('${escaped}')`;
-          addBatch([{ sel: sel1, isCypress: true }]);
-        }
-      }
-    }
-
-    // 4) Позиционные
-    if (!budgetExpired()) addBatch(__timeit('byNthChild', () => byNthChild(el)));
-    if (!budgetExpired()) addBatch(__timeit('byParentWithNth', () => byParentWithNth(el)));
-    if (!budgetExpired()) addBatch(__timeit('bySiblingSelectors', () => bySiblingSelectors(el)));
-    if (!budgetExpired()) addBatch(__timeit('byCalendarSelectors', () => byCalendarSelectors(el)));
-
-    // 5) Агрессивные — гейтим по размеру DOM и количеству базовых
-    if (__dompickConfig.aggressiveEnabled && !haveEnoughBasic) {
-      const totalDescendants = __countDescendants(document.body, __dompickConfig.domSizeSoftCap + 1);
-      if (totalDescendants <= __dompickConfig.domSizeSoftCap) {
-        if (__canRun('generateAggressiveFallbacks', 3)) {
-          addBatch(__timeit('generateAggressiveFallbacks', () => generateAggressiveFallbacks(el)));
-        }
-        if (__canRun('generateSuperAggressiveFallbacks', 4)) {
-          addBatch(__timeit('generateSuperAggressiveFallbacks', () => generateSuperAggressiveFallbacks(el)));
-        }
-      } else {
-        __dlog('info', `🔥 агрессивные стратегии: пропуск (DOM слишком большой: ${totalDescendants} > ${__dompickConfig.domSizeSoftCap})`);
-      }
-    } else if (!__dompickConfig.aggressiveEnabled) {
-      __dlog('info', '🔥 агрессивные стратегии: отключены глобально');
-    } else {
-      __dlog('info', `🔥 агрессивные стратегии: пропуск (достаточно базовых: ${goodBasicCount} >= ${__dompickConfig.targetEnoughBasic})`);
-    }
-
-    return allSelectors;
-  }
-
-  // Категоризация селекторов по группам
-  function categorizeSelectors(selectors) {
-    const groups = {
-      basic: [],      // Без .contains и nth-child
-      contains: [],   // С .contains
-      nth: [],        // С nth-child
-      xpath: [],      // XPath
-      aggressive: []  // Агрессивные fallback
-    };
-    
-    for (const selector of selectors) {
-      const sel = selector.sel;
-      
-            if (selector.isXPath) { groups.xpath.push(selector); continue; }
-      // contains → contains
-      if (sel.includes('cy.contains') || sel.includes('.contains(')) {
-        groups.contains.push(selector);
-        continue;
-      }
-      // nth → nth
-      if (sel.includes('nth-child') || sel.includes('nth-of-type') || 
-          sel.includes(':first-child') || sel.includes(':last-child') ||
-          sel.includes(':only-child') || sel.includes(':first-of-type') ||
-          sel.includes(':last-of-type') || sel.includes(':only-of-type') ||
-          sel.includes('nth(') || sel.includes('eq(')) {
-        groups.nth.push(selector);
-        continue;
-      }
-      // Агрессивные по структуре (вместо старого порога score)
-      if (isAggressiveSelector(sel)) {
-        groups.aggressive.push(selector);
-        continue;
-      }
-      groups.basic.push(selector);
+      // Для остальных элементов - только клик
+      actions.push('click');
     }
     
-    // Динамическая сортировка по новому рейтингу
-    const sortByQuality = (a, b) => {
-      const aScore = computeSelectorScore(a, a.__targetEl || null);
-      const bScore = computeSelectorScore(b, b.__targetEl || null);
-      if (aScore !== bScore) return bScore - aScore;
-      // При равенстве — более короткий лучше
-      return a.sel.length - b.sel.length;
-    };
-    
-    groups.basic.sort(sortByQuality);
-    groups.contains.sort(sortByQuality);
-    groups.nth.sort(sortByQuality);
-    groups.xpath.sort(sortByQuality);
-    groups.aggressive.sort(sortByQuality);
-    
-    return groups;
-  }
+    return actions;
+  };
   
-  // Агрессивные fallback селекторы для крайних случаев
-  function generateAggressiveFallbacks(el) {
-    const out = [];
-    const tag = el.tagName.toLowerCase();
-    
-    // 1. Селекторы с уникальными родителями + nth-child
-    const parentWithNthSelectors = generateParentNthSelectors(el);
-    out.push(...parentWithNthSelectors);
-    
-    // 2. Селекторы по позиции в документе (только если уникальные)
-    const allSameTagElements = document.querySelectorAll(tag);
-    const elementIndex = [...allSameTagElements].indexOf(el);
-    if (elementIndex >= 0) {
-      const nthSel = `${tag}:nth-of-type(${elementIndex + 1})`;
-      if (isUnique(nthSel, el)) {
-        out.push({sel: nthSel});
-      }
-    }
-    
-    // 3. Селектор по тексту для JS-режима: выбираем ближайший визуально подходящий узел
-    const textContent = el.textContent?.trim();
-    if (textContent && textContent.length > 0 && textContent.length < 50) {
-      const sample = textContent.length > 25 ? textContent.substring(0, 25) : textContent;
-      if (__dompickMode === 'js') {
-        const jsExpr = buildJsFindInScope(null, '*', sample, false);
-        out.push({ sel: jsExpr, __targetEl: el });
-      } else {
-        const partialText = sample;
-        if (partialText.length > 2) {
-          const uniqueContext = findMinimalUniqueContext(el, partialText);
-          if (uniqueContext) {
-            const contextContainsSel = `cy.get('${uniqueContext}').contains('${partialText.replace(/'/g, "\\'")}')`;
-            out.push({sel: contextContainsSel, isCypress: true});
-          } else if (isUniqueByText(el, partialText)) {
-            const containsSel = `cy.contains('${partialText.replace(/'/g, "\\'")}')`;
-            out.push({sel: containsSel, isCypress: true});
-          }
-        }
-      }
-    }
-    
-    // 4. Селекторы по атрибутам (только уникальные)
-    if (el.attributes) {
-      for (const {name, value} of el.attributes) {
-        if (name && value && value.length < 50 && !looksDynamic(value)) {
-          // Фильтруем системные классы DOM Picker'а
-          if (name === 'class' && value.includes('__dompick')) continue;
-          
-          const attrSel = `[${name}="${esc(value)}"]`;
-          if (isUnique(attrSel, el)) {
-            out.push({sel: attrSel});
-          }
-          
-          const tagAttrSel = `${tag}[${name}="${esc(value)}"]`;
-          if (isUnique(tagAttrSel, el)) {
-            out.push({sel: tagAttrSel});
-          }
-        }
-      }
-    }
-    
-    // 5. Селекторы по классам (только стабильные и уникальные)
-    if (el.classList && el.classList.length > 0) {
-      const stableClasses = [...el.classList].filter(c => 
-        c && 
-        !looksDynamic(c) && 
-        !c.startsWith('__dompick') && // Исключаем наши служебные классы
-        c.length > 1
-      );
-      
-      for (const cls of stableClasses.slice(0, 3)) {
-        const classSel = `.${esc(cls)}`;
-        if (isUnique(classSel, el)) {
-          out.push({sel: classSel});
-        }
-        
-        const tagClassSel = `${tag}.${esc(cls)}`;
-        if (isUnique(tagClassSel, el)) {
-          out.push({sel: tagClassSel});
-        }
-      }
-    }
-    
-    // 6. Простой селектор по тегу только если он уникален
-    if (isUnique(tag, el)) {
-      out.push({sel: tag});
-    }
-    
-    // 7. Минимальный уникальный позиционный селектор (короткий суффикс абсолютного пути)
-    const minimalPositional = buildMinimalPositionalSelector(el);
-    if (minimalPositional) {
-      out.push({ sel: minimalPositional });
-    }
-    
-    // 8. Абсолютный CSS-путь (как самый низкоприоритетный запасной вариант)
-    out.push({ sel: buildAbsoluteCssPath(el) });
-    
-    return out;
-  }
-
-  // Абсолютный CSS-путь к элементу: html > body > ... > tag:nth-of-type(n)
-  function buildAbsoluteCssPath(el) {
-    try {
-      const parts = [];
-      let current = el;
-      const stopAt = document.documentElement; // html
-      while (current && current !== stopAt) {
-        const parent = current.parentElement;
-        if (!parent) break;
-        const tag = current.tagName.toLowerCase();
-        const sameTagSiblings = [...parent.children].filter(c => c.tagName.toLowerCase() === tag);
-        const index = sameTagSiblings.indexOf(current);
-        // Если среди детей родителя этот tag встречается один раз, nth-of-type не нужен
-        const part = sameTagSiblings.length === 1 || index < 0 ? tag : `${tag}:nth-of-type(${index + 1})`;
-        parts.unshift(part);
-        current = parent;
-      }
-      return parts.length ? parts.join(' > ') : el.tagName.toLowerCase();
-    } catch {
-      return el.tagName ? el.tagName.toLowerCase() : '*';
-    }
-  }
-
-  // Строит массив сегментов абсолютного пути от корня к элементу
-  function buildAbsoluteCssSegments(el) {
-    const segments = [];
-    let current = el;
-    const stopAt = document.documentElement; // html
-    while (current && current !== stopAt) {
-      const parent = current.parentElement;
-      if (!parent) break;
-      const tag = current.tagName.toLowerCase();
-      const sameTagSiblings = [...parent.children].filter(c => c.tagName.toLowerCase() === tag);
-      const index = sameTagSiblings.indexOf(current);
-      const needsNth = !(sameTagSiblings.length === 1 || index < 0);
-      segments.unshift({ tag, index: index + 1, needsNth });
-      current = parent;
-    }
-    return segments;
-  }
-
-  // Возвращает самый короткий уникальный позиционный селектор (суффикс абсолютного пути)
-  function buildMinimalPositionalSelector(el) {
-    try {
-      const segments = buildAbsoluteCssSegments(el);
-      if (segments.length === 0) return el.tagName.toLowerCase();
-      // Функция преобразования сегментов в селекторную строку
-      const joinFrom = (startIdx) => segments
-        .slice(startIdx)
-        .map(seg => seg.needsNth ? `${seg.tag}:nth-of-type(${seg.index})` : seg.tag)
-        .join(' > ');
-      
-      // Проверяем суффиксы от самого короткого (лист) к более длинным
-      for (let i = segments.length - 1; i >= 0; i--) {
-        const candidate = joinFrom(i);
-        if (isUnique(candidate, el)) return candidate;
-        // Попробуем локально упростить листовой сегмент, если возможно
-        if (i === segments.length - 1) {
-          const leaf = segments[segments.length - 1];
-          if (leaf.needsNth) {
-            const withoutNth = joinFrom(i).replace(/:nth-of-type\(\d+\)$/,'');
-            if (isUnique(withoutNth, el)) return withoutNth;
-          }
-        }
-      }
-      // Если ни один суффикс не уникален — возвращаем полный путь
-      return joinFrom(0);
-    } catch {
-      return buildAbsoluteCssPath(el);
-    }
-  }
-
-  // Генерация селекторов с уникальными родителями + nth-child
-  function generateParentNthSelectors(el) {
-    const out = [];
-    const tag = el.tagName.toLowerCase();
-    let currentParent = el.parentElement;
-    let depth = 0;
-    const maxDepth = 6;
-    
-    while (currentParent && depth < maxDepth) {
-      // Получаем позицию элемента среди детей родителя
-      const siblings = [...currentParent.children];
-      const elementIndex = siblings.indexOf(el) + 1;
-      
-      // 1. Родитель с ID + nth-child
-      if (currentParent.id) {
-        const parentId = `#${esc(currentParent.id)}`;
-        if (document.querySelectorAll(parentId).length === 1) {
-          // Различные варианты nth-child
-          const selectors = [
-            `${parentId} > ${tag}:nth-child(${elementIndex})`,
-            `${parentId} > :nth-child(${elementIndex})`,
-            `${parentId} ${tag}:nth-child(${elementIndex})`
-          ];
-          
-          for (const sel of selectors) {
-              if (isUnique(sel, el)) {
-                out.push({sel});
-              }
-          }
-        }
-      }
-      
-      // 2. Родитель с data-атрибутами + nth-child
-      for (const attr of prefDataAttrs) {
-        const value = currentParent.getAttribute(attr);
-        if (value) {
-          const parentSel = `[${attr}="${esc(value)}"]`;
-          if (document.querySelectorAll(parentSel).length === 1) {
-            const selectors = [
-              `${parentSel} > ${tag}:nth-child(${elementIndex})`,
-              `${parentSel} > :nth-child(${elementIndex})`,
-              `${parentSel} ${tag}:nth-child(${elementIndex})`
-            ];
-            
-            for (const sel of selectors) {
-              if (isUnique(sel, el)) {
-                out.push({sel});
-              }
-            }
-          }
-        }
-      }
-      
-      // 3. Родитель с уникальными классами + nth-child
-      if (currentParent.classList && currentParent.classList.length > 0) {
-        const stableClasses = [...currentParent.classList].filter(c => 
-          c && 
-          !looksDynamic(c) && 
-          !c.startsWith('__dompick') &&
-          c.length > 2
-        );
-        
-        // Одиночные классы
-        for (const cls of stableClasses.slice(0, 2)) {
-          const parentSel = `.${esc(cls)}`;
-          if (document.querySelectorAll(parentSel).length === 1) {
-            const selectors = [
-              `${parentSel} > ${tag}:nth-child(${elementIndex})`,
-              `${parentSel} > :nth-child(${elementIndex})`,
-              `${parentSel} ${tag}:nth-child(${elementIndex})`
-            ];
-            
-            for (const sel of selectors) {
-              if (isUnique(sel, el)) {
-                out.push({sel});
-              }
-            }
-          }
-        }
-        
-        // Комбинации классов
-        if (stableClasses.length >= 2) {
-          const parentSel = `.${esc(stableClasses[0])}.${esc(stableClasses[1])}`;
-          if (document.querySelectorAll(parentSel).length === 1) {
-            const selectors = [
-              `${parentSel} > ${tag}:nth-child(${elementIndex})`,
-              `${parentSel} > :nth-child(${elementIndex})`
-            ];
-            
-            for (const sel of selectors) {
-              if (isUnique(sel, el)) {
-                out.push({sel});
-              }
-            }
-          }
-        }
-      }
-      
-      // 4. Семантические родители + nth-child
-      const semanticTags = ['header', 'nav', 'main', 'section', 'article', 'aside', 'footer', 'form', 'table', 'tbody', 'thead', 'ul', 'ol', 'dl'];
-      const parentTag = currentParent.tagName.toLowerCase();
-      if (semanticTags.includes(parentTag)) {
-        const sameTagParents = document.querySelectorAll(parentTag);
-        if (sameTagParents.length <= 3) {
-          const selectors = [
-            `${parentTag} > ${tag}:nth-child(${elementIndex})`,
-            `${parentTag} > :nth-child(${elementIndex})`
-          ];
-          
-          for (const sel of selectors) {
-            if (isUnique(sel, el)) {
-              out.push({sel});
-            }
-          }
-        }
-      }
-      
-      currentParent = currentParent.parentElement;
-      depth++;
-    }
-    
-    return out;
-  }
-
-  // Супер-агрессивные fallback селекторы для экстремальных случаев
-  function generateSuperAggressiveFallbacks(el) {
-    const out = [];
-    const tag = el.tagName.toLowerCase();
-    
-    // 1. Глубокие nth-child цепочки
-    const deepNthSelectors = generateDeepNthSelectors(el);
-    out.push(...deepNthSelectors);
-    
-    // 2. Селекторы через соседние элементы
-    const siblingSelectors = generateAdvancedSiblingSelectors(el);
-    out.push(...siblingSelectors);
-    
-    // 3. Комбинированные селекторы с частичными атрибутами
-    const partialAttrSelectors = generatePartialAttributeSelectors(el);
-    out.push(...partialAttrSelectors);
-    
-    // 4. Селекторы по псевдо-классам
-    const pseudoSelectors = generatePseudoClassSelectors(el);
-    out.push(...pseudoSelectors);
-    
-    // 5. Относительные Cypress селекторы
-    const relativeCypressSelectors = generateRelativeCypressSelectors(el);
-    out.push(...relativeCypressSelectors);
-    
-    return out;
-  }
-
-  // Генерация глубоких nth-child цепочек
-  function generateDeepNthSelectors(el) {
-    const out = [];
-    let current = el;
-    const path = [];
-    let depth = 0;
-    const maxDepth = 4;
-    
-    // Строим путь от элемента к родителям
-    while (current && current.parentElement && depth < maxDepth) {
-      const parent = current.parentElement;
-      const siblings = [...parent.children];
-      const index = siblings.indexOf(current) + 1;
-      const tag = current.tagName.toLowerCase();
-      
-      path.unshift({tag, index});
-      current = parent;
-      depth++;
-      
-      // Проверяем, есть ли у текущего родителя уникальные идентификаторы
-      if (current.id) {
-        const rootSel = `#${esc(current.id)}`;
-        if (document.querySelectorAll(rootSel).length === 1) {
-          const pathSel = path.map(p => `${p.tag}:nth-child(${p.index})`).join(' > ');
-          const fullSel = `${rootSel} > ${pathSel}`;
-          if (isUnique(fullSel, el)) {
-            out.push({sel: fullSel});
-          }
-          break; // Нашли уникальный корень
-        }
-      }
-      
-      // Проверяем data-атрибуты
-      for (const attr of prefDataAttrs.slice(0, 2)) {
-        const value = current.getAttribute && current.getAttribute(attr);
-        if (value) {
-          const rootSel = `[${attr}="${esc(value)}"]`;
-          if (document.querySelectorAll(rootSel).length === 1) {
-            const pathSel = path.map(p => `${p.tag}:nth-child(${p.index})`).join(' > ');
-            const fullSel = `${rootSel} > ${pathSel}`;
-            if (isUnique(fullSel, el)) {
-              out.push({sel: fullSel});
-            }
-            break;
-          }
-        }
-      }
-    }
-    
-    return out;
-  }
-
-  // Продвинутые селекторы через соседние элементы
-  function generateAdvancedSiblingSelectors(el) {
-    const out = [];
-    const parent = el.parentElement;
-    if (!parent) return out;
-    
-    const tag = el.tagName.toLowerCase();
-    const siblings = [...parent.children];
-    const index = siblings.indexOf(el);
-    
-    // Селекторы через предыдущие соседние элементы
-    for (let i = Math.max(0, index - 3); i < index; i++) {
-      const prevSibling = siblings[i];
-      if (!prevSibling) continue;
-      
-      // По ID предыдущего элемента
-      if (prevSibling.id) {
-        const siblingId = `#${esc(prevSibling.id)}`;
-        const distance = index - i;
-        
-        if (distance === 1) {
-          const adjSel = `${siblingId} + ${tag}`;
-          if (isUnique(adjSel, el)) {
-            out.push({sel: adjSel});
-          }
-        } else {
-          const genSel = `${siblingId} ~ ${tag}:nth-of-type(${distance})`;
-          if (isUnique(genSel, el)) {
-            out.push({sel: genSel});
-          }
-        }
-      }
-      
-      // По классам предыдущего элемента
-      if (prevSibling.classList && prevSibling.classList.length > 0) {
-        const stableClasses = [...prevSibling.classList].filter(c => 
-          c && !looksDynamic(c) && !c.startsWith('__dompick')
-        );
-        
-        for (const cls of stableClasses.slice(0, 1)) {
-          const siblingClass = `.${esc(cls)}`;
-          const distance = index - i;
-          
-          if (distance === 1) {
-            const adjSel = `${siblingClass} + ${tag}`;
-            if (isUnique(adjSel, el)) {
-              out.push({sel: adjSel});
-            }
-          }
-        }
-      }
-    }
-    
-    return out;
-  }
-
-  // Селекторы с частичными атрибутами
-  function generatePartialAttributeSelectors(el) {
-    const out = [];
-    const tag = el.tagName.toLowerCase();
-    
-    if (!el.attributes) return out;
+  // Функция для обнаружения похожих атрибутов
+  const findSimilarAttrs = (el) => {
+    const similarAttrs = [];
+    if (!el.attributes) return similarAttrs;
     
     for (const {name, value} of el.attributes) {
-      if (!value || value.length < 3 || looksDynamic(value)) continue;
-      if (name === 'class' && value.includes('__dompick')) continue;
-      
-      // Селекторы с частичным совпадением атрибутов
-      if (value.length > 10) {
-        const partialValue = value.substring(0, Math.min(value.length - 2, 15));
-        const partialSel = `${tag}[${name}^="${esc(partialValue)}"]`;
-        if (isUnique(partialSel, el)) {
-          out.push({sel: partialSel});
-        }
-      }
-      
-      // Селекторы по окончанию атрибута
-      if (value.length > 8) {
-        const endValue = value.substring(Math.max(0, value.length - 10));
-        const endSel = `${tag}[${name}$="${esc(endValue)}"]`;
-        if (isUnique(endSel, el)) {
-          out.push({sel: endSel});
-        }
-      }
-      
-      // Селекторы по содержимому атрибута
-      if (value.includes('-') || value.includes('_')) {
-        const parts = value.split(/[-_]/);
-        for (const part of parts) {
-          if (part.length > 3 && !looksDynamic(part)) {
-            const containsSel = `${tag}[${name}*="${esc(part)}"]`;
-            if (isUnique(containsSel, el)) {
-              out.push({sel: containsSel});
-            }
-          }
-        }
+      if (!value || value.trim() === '') continue;
+      // Пропускаем уже известные атрибуты
+      if (prefDataAttrs.includes(name) || okAttrs.includes(name)) continue;
+      // Ищем атрибуты, которые выглядят как уникальные идентификаторы
+      const valueStr = value.toString();
+      // Проверяем, что значение не слишком длинное и не слишком короткое
+      if (valueStr.length < 2 || valueStr.length > 50) continue;
+      // Пропускаем динамические значения
+      if (looksDynamic(valueStr)) continue;
+      // Проверяем, что значение содержит буквы (не только цифры)
+      if (!/[a-zA-Z]/.test(valueStr)) continue;
+      // Проверяем, что атрибут уникален в документе
+      const selector = `[${name}="${esc(valueStr)}"]`;
+      if (isUnique(selector, el)) {
+        similarAttrs.push({name, value: valueStr});
       }
     }
     
-    return out;
-  }
-
-  // Селекторы по псевдо-классам
-  function generatePseudoClassSelectors(el) {
-    const out = [];
-    const tag = el.tagName.toLowerCase();
-    const parent = el.parentElement;
-    if (!parent) return out;
-    
-    const siblings = [...parent.children];
-    const index = siblings.indexOf(el);
-    const sameTagSiblings = siblings.filter(s => s.tagName === el.tagName);
-    const sameTagIndex = sameTagSiblings.indexOf(el);
-    
-    // :first-child, :last-child, :only-child
-    if (index === 0) {
-      const firstSel = `${tag}:first-child`;
-      if (isUnique(firstSel, el)) {
-        out.push({sel: firstSel});
-      }
-    }
-    
-    if (index === siblings.length - 1) {
-      const lastSel = `${tag}:last-child`;
-      if (isUnique(lastSel, el)) {
-        out.push({sel: lastSel});
-      }
-    }
-    
-    if (siblings.length === 1) {
-      const onlySel = `${tag}:only-child`;
-      if (isUnique(onlySel, el)) {
-        out.push({sel: onlySel});
-      }
-    }
-    
-    // :first-of-type, :last-of-type, :only-of-type
-    if (sameTagIndex === 0) {
-      const firstTypeSel = `${tag}:first-of-type`;
-      if (isUnique(firstTypeSel, el)) {
-        out.push({sel: firstTypeSel});
-      }
-    }
-    
-    if (sameTagIndex === sameTagSiblings.length - 1) {
-      const lastTypeSel = `${tag}:last-of-type`;
-      if (isUnique(lastTypeSel, el)) {
-        out.push({sel: lastTypeSel});
-      }
-    }
-    
-    if (sameTagSiblings.length === 1) {
-      const onlyTypeSel = `${tag}:only-of-type`;
-      if (isUnique(onlyTypeSel, el)) {
-        out.push({sel: onlyTypeSel});
-      }
-    }
-    
-    // nth-child с формулами
-    const totalSiblings = siblings.length;
-    if (totalSiblings > 2) {
-      // Четные/нечетные
-      if (index % 2 === 1) { // четный (nth-child считает с 1)
-        const evenSel = `${tag}:nth-child(even)`;
-        if (isUnique(evenSel, el)) {
-          out.push({sel: evenSel});
-        }
-      } else {
-        const oddSel = `${tag}:nth-child(odd)`;
-        if (isUnique(oddSel, el)) {
-          out.push({sel: oddSel});
-        }
-      }
-    }
-    
-    return out;
-  }
-
-  // Относительные Cypress селекторы
-  function generateRelativeCypressSelectors(el) {
-    const out = [];
-    
-    // Поиск ближайших элементов с текстом для относительного позиционирования
-    const nearbyElements = findNearbyElementsWithText(el);
-    
-    for (const nearbyEl of nearbyElements) {
-      const nearbyTexts = getAllTexts(nearbyEl);
-      
-      for (const nearbyText of nearbyTexts) {
-        if (!isGoodTextForContains(nearbyText)) continue;
-        
-        // Проверяем уникальность ближайшего элемента
-        if (isUniqueByText(nearbyEl, nearbyText)) {
-          const escapedNearbyText = nearbyText.replace(/'/g, "\\'");
-          
-          // Генерируем БОЛЕЕ СПЕЦИФИЧНЫЕ относительные селекторы
-          const specificRelationships = getSpecificElementRelationships(nearbyEl, el);
-          
-          for (const relationship of specificRelationships) {
-            const relativeSel = `cy.contains('${escapedNearbyText}').${relationship.method}`;
-            
-            // КРИТИЧНО: проверяем, что этот селектор действительно уникален
-            if (validateRelativeCypressSelector(relativeSel, el)) {
-              out.push({sel: relativeSel, score: relationship.score, isCypress: true});
-            }
-          }
-        }
-      }
-    }
-    
-    return out;
-  }
-
-  // Поиск ближайших элементов с текстом
-  function findNearbyElementsWithText(el) {
-    const nearby = [];
-    const parent = el.parentElement;
-    if (!parent) return nearby;
-    
-    // Соседние элементы
-    const siblings = [...parent.children];
-    const index = siblings.indexOf(el);
-    
-    // Предыдущие и следующие соседи
-    for (let i = Math.max(0, index - 2); i <= Math.min(siblings.length - 1, index + 2); i++) {
-      if (i !== index) {
-        const sibling = siblings[i];
-        const text = getElementText(sibling);
-        if (text && text.length > 2) {
-          nearby.push(sibling);
-        }
-      }
-    }
-    
-    // Родительские элементы с текстом
-    let currentParent = parent;
-    let depth = 0;
-    while (currentParent && depth < 2) {
-      const parentText = getElementText(currentParent);
-      if (parentText && parentText.length > 2) {
-        nearby.push(currentParent);
-      }
-      currentParent = currentParent.parentElement;
-      depth++;
-    }
-    
-    return nearby;
-  }
-
-  // Определение СПЕЦИФИЧНЫХ отношений между элементами
-  function getSpecificElementRelationships(fromEl, toEl) {
-    const relationships = [];
-    
-    // 1. Проверяем, является ли toEl потомком fromEl
-    if (fromEl.contains(toEl)) {
-      // Прямой потомок
-      if (fromEl === toEl.parentElement) {
-        const children = [...fromEl.children];
-        if (children.length === 1) {
-          // Единственный потомок - безопасно использовать children()
-          relationships.push({method: 'children()'});
-        } else {
-          // Множественные потомки - используем более специфичный селектор
-          const targetTag = toEl.tagName.toLowerCase();
-          const sameTagChildren = children.filter(child => child.tagName.toLowerCase() === targetTag);
-          
-          if (sameTagChildren.length === 1) {
-            relationships.push({method: `children('${targetTag}')`});
-          } else {
-            const childIndex = children.indexOf(toEl);
-            relationships.push({method: `children().eq(${childIndex})`});
-          }
-        }
-      } else {
-        // Любой потомок - используем find с более специфичными селекторами
-        const descendants = fromEl.querySelectorAll('*');
-        if (descendants.length === 1) {
-          // Единственный потомок - безопасно
-        relationships.push({method: 'find("*")'});
-        } else {
-          const targetTag = toEl.tagName.toLowerCase();
-          const sameTagDescendants = fromEl.querySelectorAll(targetTag);
-          
-          if (sameTagDescendants.length === 1) {
-            relationships.push({method: `find('${targetTag}')`});
-          } else {
-            // Слишком много потомков - не используем
-            // relationships не добавляем
-          }
-        }
-      }
-    }
-    
-    // 2. Проверяем соседние элементы
-    if (fromEl.parentElement === toEl.parentElement) {
-      const siblings = [...fromEl.parentElement.children];
-      const fromIndex = siblings.indexOf(fromEl);
-      const toIndex = siblings.indexOf(toEl);
-      
-      if (toIndex === fromIndex + 1) {
-        // Следующий соседний элемент
-        relationships.push({method: 'next()'});
-      } else if (toIndex > fromIndex) {
-        // Следующие элементы
-        const nextElements = siblings.slice(fromIndex + 1);
-        const targetInNext = nextElements.indexOf(toEl);
-        
-        if (nextElements.length === 1) {
-          relationships.push({method: 'nextAll()'});
-        } else if (targetInNext >= 0) {
-          relationships.push({method: `nextAll().eq(${targetInNext})`});
-        }
-      } else if (toIndex === fromIndex - 1) {
-        // Предыдущий соседний элемент
-        relationships.push({method: 'prev()'});
-      } else if (toIndex < fromIndex) {
-        // Предыдущие элементы
-        const prevElements = siblings.slice(0, fromIndex);
-        const targetInPrev = prevElements.indexOf(toEl);
-        
-        if (prevElements.length === 1) {
-          relationships.push({method: 'prevAll()'});
-        } else if (targetInPrev >= 0) {
-          const reverseIndex = prevElements.length - 1 - targetInPrev;
-          relationships.push({method: `prevAll().eq(${reverseIndex})`});
-        }
-      }
-    }
-    
-    // 3. Проверяем родительские отношения
-    if (toEl.contains(fromEl)) {
-      // fromEl является потомком toEl
-      if (toEl === fromEl.parentElement) {
-        relationships.push({method: 'parent()'});
-      } else {
-        // Более далекий предок - используем parents с селектором
-        const targetTag = toEl.tagName.toLowerCase();
-        const ancestors = [];
-        let current = fromEl.parentElement;
-        while (current && current !== toEl) {
-          ancestors.push(current);
-          current = current.parentElement;
-        }
-        
-        if (ancestors.length === 0) {
-          relationships.push({method: 'parent()'});
-        } else {
-          const sameTagAncestors = [];
-          current = fromEl.parentElement;
-          while (current) {
-            if (current.tagName.toLowerCase() === targetTag) {
-              sameTagAncestors.push(current);
-            }
-            current = current.parentElement;
-          }
-          
-          if (sameTagAncestors.length === 1 && sameTagAncestors[0] === toEl) {
-            relationships.push({method: `parents('${targetTag}')`});
-          }
-        }
-      }
-    }
-    
-    return relationships;
-  }
-
-  // ==== UI ====
-  function showToast(msg){ 
-    let t=document.querySelector('.__dompick-toast'); 
-    if(!t){ 
-      t=document.createElement('div'); 
-      t.className='__dompick-toast'; 
-      // Всегда добавляем toast в body для правильного z-index
-      document.body.appendChild(t);
-    } 
-    t.textContent=msg; 
-    t.classList.add('show'); 
-    setTimeout(()=>t.classList.remove('show'),1400); 
-  }
-  function openModalFor(el) {
-    // Проверяем кэш для этого элемента
-    if (__dompickSelectorCache && __dompickCachedElement === el) {
-      // Используем кэшированные селекторы
-      const modal = document.createElement('div');
-      modal.className = '__dompick-modal';
-      setTrustedHTML(modal, `
-        <div class="__dompick-backdrop"></div>
-        <div class="__dompick-dialog __dompick-theme-transition">
-          <div class="__dompick-head">
-            <div class="__dompick-title">Селекторы для ${__dompickMode === 'js' ? 'JS' : 'Cypress'}</div>
-            <button class="__dompick-copy" data-close>✖</button>
-          </div>
-          <div class="__dompick-body">
-            <div class="__dompick-groups">
-              <div id="__dompick-loading" style="opacity:.8;font-size:12px;color:var(--dompick-text-secondary)">Загрузка из кэша...</div>
-            </div>
-          </div>
-        </div>
-      `);
-      document.body.appendChild(modal);
-
-      const groupsContainer = modal.querySelector('.__dompick-groups');
-      const closeModal = () => {
-        if (fixedHighlighted) {
-          removeHighlight(fixedHighlighted);
-          fixedHighlighted = null;
-        }
-        modal.remove();
-      };
-      modal.querySelector('[data-close]').addEventListener('click', closeModal);
-      modal.querySelector('.__dompick-backdrop').addEventListener('click', closeModal);
-      modal.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal(); });
-
-      // Быстро отображаем кэшированные селекторы
-      setTimeout(() => {
-        const loading = groupsContainer.querySelector('#__dompick-loading');
-        if (loading) loading.remove();
-
-        const availableActions = getAvailableActions(el);
-        const cachedGroups = __dompickSelectorCache[__dompickMode] || __dompickSelectorCache.cypress; // fallback
-
-        createSelectorGroup(groupsContainer, 'Базовые селекторы CSS', cachedGroups.basicSelectors, cachedGroups.moreBasic, availableActions, 'basic');
-        const containsTitle = (__dompickMode === 'js') ? 'Селекторы по тексту' : 'Селекторы с .contains';
-        createSelectorGroup(groupsContainer, containsTitle, cachedGroups.containsSelectors, cachedGroups.moreContains, availableActions, 'contains');
-        createSelectorGroup(groupsContainer, 'Позиционные селекторы', cachedGroups.nthSelectors, cachedGroups.moreNth, availableActions, 'nth');
-        createSelectorGroup(groupsContainer, 'XPath селекторы', cachedGroups.xpathSelectors || [], cachedGroups.moreXPath || [], availableActions, 'xpath');
-        if (cachedGroups.aggressive && cachedGroups.aggressive.length > 0) {
-          createSelectorGroup(groupsContainer, 'Агрессивные селекторы', cachedGroups.aggressive.slice(0, 5), cachedGroups.aggressive.slice(5), availableActions, 'aggressive');
-        }
-      }, 50);
-      return;
-    }
-
-    // Открываем модалку СРАЗУ, а тяжёлую генерацию переносим на idle/next-tick
-    const modal = document.createElement('div');
-    modal.className = '__dompick-modal';
-    setTrustedHTML(modal, `
-      <div class="__dompick-backdrop"></div>
-      <div class="__dompick-dialog __dompick-theme-transition">
-        <div class="__dompick-head">
-          <div class="__dompick-title">Селекторы для ${__dompickMode === 'js' ? 'JS' : 'Cypress'}</div>
-          <button class="__dompick-copy" data-close>✖</button>
-        </div>
-        <div class="__dompick-body">
-          <div class="__dompick-groups">
-            <div id="__dompick-loading" style="opacity:.8;font-size:12px;color:var(--dompick-text-secondary)">Генерация селекторов...</div>
-          </div>
-        </div>
-      </div>
-    `);
-    document.body.appendChild(modal);
-
-    const groupsContainer = modal.querySelector('.__dompick-groups');
-    const closeModal = () => {
-      if (fixedHighlighted) {
-        removeHighlight(fixedHighlighted);
-        fixedHighlighted = null;
-      }
-      // Очищаем кэш при закрытии модального окна
-      __dompickSelectorCache = null;
-      __dompickCachedElement = null;
-      modal.remove();
-    };
-    modal.querySelector('[data-close]').addEventListener('click', closeModal);
-    modal.querySelector('.__dompick-backdrop').addEventListener('click', closeModal);
-    modal.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal(); });
-
-    // Планируем асинхронную генерацию с тайм-бюджетом
-    const runAsync = () => { // фоновая (idle/next-tick) генерация селекторов :contentReference[oaicite:8]{index=8}
-      // Устанавливаем увеличенный бюджет на генерацию и чистим кэш
-      resetPerfGuards();
-      const __buildStart = performance.now();
-      __buildBudgetEnd = __buildStart + (__dompickConfig.buildBudgetMs || 5000); // можно увеличить при необходимости
-      
-      // Генерируем селекторы для текущего режима
-      const groups = buildCandidates(el);
-      const __buildMs = performance.now() - __buildStart;
-      if (__dompickConfig.debug) {
-        __perfStats.buildRuns.push({ ctx: 'modalAsync', ms: __buildMs,
-          basic: groups.basicSelectors.length, contains: groups.containsSelectors.length,
-          nth: groups.nthSelectors.length, aggressive: (groups.aggressive?.length || 0)
-        });
-        if (__buildMs > __dompickConfig.slowBuildThresholdMs) {
-          __dlog('info', `⏱️ генерация (async) заняла ${__buildMs.toFixed(1)}ms (>${__dompickConfig.slowBuildThresholdMs}ms)`);
-        }
-      }
-      
-      // Инициализируем кэш
-      __dompickSelectorCache = {
-        [__dompickMode]: groups
-      };
-      __dompickCachedElement = el;
-      
-      resetPerfGuards();
-
-      const availableActions = getAvailableActions(el);
-      const loading = groupsContainer.querySelector('#__dompick-loading');
-      if (loading) loading.remove();
-
-      createSelectorGroup(groupsContainer, 'Базовые селекторы CSS', groups.basicSelectors, groups.moreBasic, availableActions, 'basic');
-      const containsTitle = (__dompickMode === 'js') ? 'Селекторы по тексту' : 'Селекторы с .contains';
-      createSelectorGroup(groupsContainer, containsTitle, groups.containsSelectors, groups.moreContains, availableActions, 'contains');
-      createSelectorGroup(groupsContainer, 'Позиционные селекторы', groups.nthSelectors, groups.moreNth, availableActions, 'nth');
-      createSelectorGroup(groupsContainer, 'XPath селекторы', groups.xpathSelectors || [], groups.moreXPath || [], availableActions, 'xpath');
-
-      // Если есть агрессивные — тоже показываем
-      if (groups.aggressive && groups.aggressive.length > 0) {
-        createSelectorGroup(groupsContainer, 'Агрессивные селекторы', groups.aggressive.slice(0, 5), groups.aggressive.slice(5), availableActions, 'aggressive');
-      }
-
-      // ГАРАНТИЯ: если ни одного селектора не сгенерировалось — формируем абсолютный CSS‑путь
-      const totalCount = groups.basicSelectors.length + groups.containsSelectors.length + groups.nthSelectors.length + (groups.xpathSelectors?.length || 0) + (groups.aggressive?.length || 0);
-      if (totalCount === 0) {
-        const absPath = buildAbsoluteCssPath(el);
-        const fallback = [{ sel: absPath }];
-        createSelectorGroup(groupsContainer, 'Агрессивные селекторы (fallback)', fallback, [], availableActions, 'aggressive');
-      }
-      
-      resetPerfGuards();
-      __dumpPerfSummary('modalAsync', groups);
-      
-      // Убираем фоновую генерацию - селекторы для противоположного режима будут генерироваться при первом переключении
-    };
-
-    if ('requestIdleCallback' in window) {
-      window.requestIdleCallback(runAsync, { timeout: 250 });
-    } else {
-      setTimeout(runAsync, 0);
-    }
-  }
-
-  // Создание группы селекторов
-  function createSelectorGroup(container, title, selectors, moreSelectors, availableActions, groupType) {
-    if (selectors.length === 0 && moreSelectors.length === 0) return;
-    
-    const groupDiv = document.createElement('div');
-    groupDiv.className = '__dompick-group';
-    groupDiv.style.marginBottom = '20px';
-    
-    // Заголовок группы
-    const titleDiv = document.createElement('div');
-    titleDiv.style.fontWeight = 'bold';
-    titleDiv.style.marginBottom = '8px';
-    titleDiv.style.color = 'var(--dompick-accent-tertiary)';
-    titleDiv.style.fontSize = '13px';
-    titleDiv.textContent = title;
-    groupDiv.appendChild(titleDiv);
-    
-    // Контейнер для селекторов этой группы
-    const selectorsContainer = document.createElement('div');
-    selectorsContainer.className = `__dompick-selectors-${groupType}`;
-    groupDiv.appendChild(selectorsContainer);
-    
-    // Добавляем основные селекторы
-    selectors.forEach((selector, index) => {
-      addSelectorToGroup(selectorsContainer, selector, availableActions, index + 1);
-    });
-    
-    // Кнопка "Показать ещё вариантов" если есть дополнительные селекторы
-    if (moreSelectors.length > 0) {
-      const moreButton = document.createElement('button');
-      moreButton.className = '__dompick-btn';
-      moreButton.textContent = `Показать ещё вариантов (${moreSelectors.length})`;
-      moreButton.style.marginTop = '8px';
-      moreButton.style.fontSize = '11px';
-      
-      let moreShown = false;
-      moreButton.addEventListener('click', () => {
-        const currentSelectorCount = selectorsContainer.querySelectorAll('.__dompick-item').length;
-        const additionalCount = Math.min(5, moreSelectors.length); // Показываем по 5 дополнительных
-        
-        for (let i = 0; i < additionalCount; i++) {
-          const selector = moreSelectors[i];
-          addSelectorToGroup(selectorsContainer, selector, availableActions, currentSelectorCount + i + 1);
-        }
-        
-        // Обновляем кнопку
-        const remaining = moreSelectors.length - additionalCount;
-        if (remaining > 0) {
-          moreButton.textContent = `Показать ещё вариантов (${remaining})`;
-          // Убираем показанные селекторы из массива
-          moreSelectors.splice(0, additionalCount);
-        } else {
-          moreButton.style.display = 'none';
-        }
-      });
-      
-      groupDiv.appendChild(moreButton);
-    }
-    
-    container.appendChild(groupDiv);
-  }
-
-  // Конвертация Cypress-цепочек в базовое JS-выражение (возвращает элемент)
+    return similarAttrs;
+  };
+  
+  // --- 7.4: Конвертеры селекторов (Cypress <-> JS) ---
   function __escapeJsString(s){
     try { return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'"); } catch { return s; }
   }
+
   function convertJsToCypressBase(jsExpr) {
     if (!jsExpr || typeof jsExpr !== 'string') return 'cy.get("body")';
     let expr = jsExpr.trim().replace(/;\s*$/, '');
@@ -4166,7 +3681,7 @@ function byXPath(el) {
     }
     
     // Array.from(document.querySelectorAll('*')).find(el => el.textContent.includes('text'))
-    m = expr.match(/Array\.from\(document\.querySelectorAll\('([^']+)'\)\)\.find\(el => el\.textContent\.includes\('([^']+)'\)\)/);
+     m = expr.match(/Array\.from\(document\.querySelectorAll\('([^']+)'\)\)\.find\(el => el\.textContent\.includes\('([^']+)'\)\)/);
     if (m) {
       const selector = m[1];
       const text = m[2];
@@ -4198,7 +3713,7 @@ function byXPath(el) {
       return `cy.get('${sel}')`;
     }
     
-    return 'cy.get("body")';
+     return 'cy.get("body")';
   }
 
   function convertCypressToJsBase(cyExpr){
@@ -4254,7 +3769,7 @@ function byXPath(el) {
     m = expr.match(/^cy\.get\((['"])(.+?)\1\)\.filter\('\:visible'\)\.contains\((['"])(.+?)\3\)$/);
     if (m) {
       const sel = __escapeJsString(m[2]);
-      const txt = __escapeJsString(m[4]);
+       const txt = __escapeJsString(m[4]);
       return `Array.from(document.querySelectorAll('${sel}')).filter(el => el && el.offsetParent !== null).find(el => el.textContent && el.textContent.includes('${txt}'))`;
     }
     
@@ -4293,286 +3808,88 @@ function byXPath(el) {
     
     return 'document.body';
   }
-
-  // Добавление селектора в группу
-  function addSelectorToGroup(container, selector, availableActions, number) {
-    const selectorRow = document.createElement('div');
-    selectorRow.className = '__dompick-selector-row';
-    selectorRow.style.display = 'grid';
-    selectorRow.style.gridTemplateColumns = '1fr auto auto';
-    selectorRow.style.gap = '12px';
-    selectorRow.style.alignItems = 'center';
-    selectorRow.style.marginBottom = '8px';
-    
-    const buildBaseForMode = () => {
-      // ✅ XPath: показываем корректные выражения для текущего режима
-      if (selector.isXPath) {
-        if (__dompickMode === 'js') {
-          return `document.evaluate(${JSON.stringify(selector.sel)}, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue`;
-        } else {
-          // Для Cypress c плагином cypress-xpath
-          return `cy.xpath(${JSON.stringify(selector.sel)})`;
-        }
-      }
-
-      if (__dompickMode === 'js') {
-        if (selector.isCypress) return convertCypressToJsBase(selector.sel);
-        if (selector.isJs) return selector.sel;
-        return `document.querySelector('${selector.sel}')`;
-      } else {
-        if (selector.isCypress) return selector.sel;
-        if (selector.isJs || selector.sel.includes('document.querySelector') || selector.sel.includes('Array.from')) {
-          return convertJsToCypressBase(selector.sel);
-        }
-        return `cy.get('${selector.sel}')`;
-      }
-    };
-    const displayText = buildBaseForMode();
-    const copyText = displayText;
-    
-    // Левая часть - селектор
-    const selectorPart = document.createElement('div');
-    selectorPart.className = '__dompick-item';
-    selectorPart.style.marginBottom = '0';
-    
-    // Сохраняем оригинальный селектор и информацию о типе в data-атрибутах
-    const codeElement = document.createElement('code');
-    codeElement.style.fontSize = '11px';
-    codeElement.textContent = displayText;
-    codeElement.setAttribute('data-original-selector', selector.sel);
-    codeElement.setAttribute('data-was-cypress', selector.isCypress ? 'true' : 'false');
-    
-    setTrustedHTML(selectorPart, `<div><b>${number}.</b> </div>`);
-    selectorPart.querySelector('div').appendChild(codeElement);
-    
-    // Бейдж рейтинга (0..100), цвет от красного к зелёному
-    const rawScore = (typeof computeSelectorScore === 'function') ? computeSelectorScore(selector, selector.__targetEl || null) : 0;
-    const normalized = Math.max(0, Math.min(100, Math.round(50 + 50 * Math.tanh(rawScore / 80)))) ;
-    const hue = Math.round((normalized / 100) * 120); // 0 (red) -> 120 (green)
-    const ratingBadge = document.createElement('div');
-    ratingBadge.className = '__dompick-rating';
-    ratingBadge.textContent = String(normalized);
-    ratingBadge.title = `Рейтинг селектора: ${normalized} (raw: ${rawScore})`;
-    ratingBadge.style.minWidth = '36px';
-    ratingBadge.style.textAlign = 'center';
-    ratingBadge.style.fontSize = '10px';
-    ratingBadge.style.fontWeight = 'bold';
-    ratingBadge.style.color = '#fff';
-    ratingBadge.style.padding = '2px 6px';
-    ratingBadge.style.borderRadius = '6px';
-    ratingBadge.style.background = `linear-gradient(90deg, hsl(${hue}, 70%, 45%), hsl(${hue}, 70%, 38%))`;
-    ratingBadge.style.boxShadow = '0 0 0 1px rgba(0,0,0,.05) inset';
-
-    // Правая часть - кнопки
-    const buttonsContainer = document.createElement('div');
-    buttonsContainer.className = '__dompick-buttons';
-    buttonsContainer.style.flexShrink = '0'; // Не сжимать кнопки
-    
-    // Основная кнопка "Копировать"
-    const copyBtn = document.createElement('button');
-    copyBtn.className = '__dompick-copy';
-    copyBtn.textContent = 'Копировать';
-    copyBtn.style.fontSize = '10px';
-    copyBtn.addEventListener('click', () => {
-      navigator.clipboard.writeText(copyText).then(() => showToast('Скопировано'));
-    });
-    buttonsContainer.appendChild(copyBtn);
-    
-    // Кнопки действий
-    availableActions.forEach(action => {
-      const actionBtn = document.createElement('button');
-      actionBtn.className = '__dompick-action';
-      actionBtn.textContent = `.${action}()`;
-      actionBtn.style.fontSize = '10px';
-      actionBtn.addEventListener('click', () => {
-        let actionText = '';
-        if (__dompickMode === 'js') {
-          if (action === 'type') actionText = `${copyText}.value = 'текст';`;
-          else if (action === 'select') actionText = `${copyText}.value = 'значение';`;
-          else if (action === 'check') actionText = `${copyText}.checked = true;`;
-          else if (action === 'uncheck') actionText = `${copyText}.checked = false;`;
-          else if (action === 'clear') actionText = `${copyText}.value = '';`;
-          else actionText = `${copyText}.click();`;
-        } else {
-          actionText = action === 'type' ? 
-            `${copyText}.${action}('текст');` :
-            action === 'select' ?
-            `${copyText}.${action}('значение');` :
-            `${copyText}.${action}();`;
-        }
-        navigator.clipboard.writeText(actionText).then(() => showToast(`Скопировано: .${action}()`));
-      });
-      buttonsContainer.appendChild(actionBtn);
-    });
-    
-    selectorRow.appendChild(selectorPart);
-    selectorRow.appendChild(ratingBadge);
-    selectorRow.appendChild(buttonsContainer);
-    container.appendChild(selectorRow);
-  }
-
-  // ==== Обработчики событий ====
-  const activateSelectionMode = () => {
-    if (isSelectionModeActive) return;
-    isSelectionModeActive = true;
-    if (!overlayEl) {
-      overlayEl = document.createElement('div');
-      overlayEl.className = '__dompick-overlay';
-    }
-
-    const handleMove = (e) => {
-      const x = e.clientX;
-      const y = e.clientY;
-      // Временно скрываем overlay, чтобы получить реальный элемент под курсором
-      overlayEl.style.display = 'none';
-      const raw = document.elementFromPoint(x, y);
-      overlayEl.style.display = '';
-
-      // Если попали в нашу панель/модалку — игнорируем
-      if (!raw || raw === panel || (raw.closest && raw.closest('.__dompick-panel, .__dompick-modal'))) {
-        if (currentHighlighted && currentHighlighted !== fixedHighlighted) {
-          removeHighlight(currentHighlighted);
-          currentHighlighted = null;
-        }
-        lastHoveredElement = null;
-        return;
-      }
-
-      const target = snapTarget(raw);
-      if (!target || target === panel || panel.contains(target) || (target.closest && target.closest('.__dompick-panel, .__dompick-modal'))) {
-        return;
-      }
-
-      if (currentHighlighted && currentHighlighted !== fixedHighlighted && currentHighlighted !== target) {
-        removeHighlight(currentHighlighted);
-      }
-      currentHighlighted = target;
-      highlightElement(target);
-      lastHoveredElement = target;
-    };
-
-    const handleClick = (e) => {
-      e.preventDefault();
-      e.stopImmediatePropagation();
-      let target = lastHoveredElement;
-      if (!target) {
-        // На всякий случай определим элемент под кликом
-        overlayEl.style.display = 'none';
-        const raw = document.elementFromPoint(e.clientX, e.clientY);
-        overlayEl.style.display = '';
-        if (raw && !(raw === panel || (raw.closest && raw.closest('.__dompick-panel, .__dompick-modal')))) {
-          target = snapTarget(raw);
-        }
-      }
-
-      if (target && !(target === panel || panel.contains(target))) {
-        if (fixedHighlighted) {
-          removeHighlight(fixedHighlighted);
-        }
-        fixedHighlighted = target;
-        highlightElement(target);
-        openModalFor(target);
-      }
-
-      // После клика — выходим из режима
+  
+  // =========================================================================
+  // РАЗДЕЛ 8: ИНИЦИАЛИЗАЦИЯ И ОЧИСТКА
+  // =========================================================================
+  
+  // --- Функция уничтожения/закрытия ---
+  // Вызывается при клике на кнопку "Закрыть". Полностью удаляет все элементы, стили и обработчики.
+  document.getElementById('__dompick-close').addEventListener('click', () => {
+    // 1) Снять режим выбора и убрать оверлей
+    if (typeof deactivateSelectionMode === 'function') {
       deactivateSelectionMode();
-    };
-
-    overlayEl.addEventListener('mousemove', handleMove, true);
-    overlayEl.addEventListener('click', handleClick, true);
-    document.body.appendChild(overlayEl);
-
-    // Сохраним ссылки на обработчики для безопасного снятия
-    overlayEl.__dompickMove = handleMove;
-    overlayEl.__dompickClick = handleClick;
-  };
-
-  const deactivateSelectionMode = () => {
-    if (!isSelectionModeActive) return;
-    isSelectionModeActive = false;
-    lastHoveredElement = null;
-    if (overlayEl) {
-      if (overlayEl.__dompickMove) overlayEl.removeEventListener('mousemove', overlayEl.__dompickMove, true);
-      if (overlayEl.__dompickClick) overlayEl.removeEventListener('click', overlayEl.__dompickClick, true);
-      if (overlayEl.parentNode) overlayEl.parentNode.removeChild(overlayEl);
     }
-    // Убираем hover-подсветку, не трогая зафиксированную
-    if (currentHighlighted && currentHighlighted !== fixedHighlighted) {
-      removeHighlight(currentHighlighted);
-      currentHighlighted = null;
-    }
-  };
+    
+    // 2) Удалить все открытые модалки/тосты на всякий случай
+    document.querySelectorAll('.__dompick-modal').forEach(m => m.remove());
+    const toast = document.querySelector('.__dompick-toast');
+    if (toast) toast.remove();
+    
+    // 3) Убрать все наши подсветки
+    document.querySelectorAll('.__dompick-highlight')
+      .forEach(el => el.classList.remove('__dompick-highlight'));
 
-  function onKeyDown(e) {
-    if (e.key === 'Control') {
-      isCtrlPressed = true;
-      // Входим в режим выбора
-      activateSelectionMode();
+    // 4) Снять классы темы с body
+    document.body.classList.remove('__dompick-theme-js','__dompick-theme-cypress','__dompick-theme-transition');
+
+    // 5) Снять листенеры как и было
+    window.removeEventListener('click', onClick, true);
+    window.removeEventListener('mouseover', onMouseOver, true);
+    window.removeEventListener('mouseout', onMouseOut, true);
+    window.removeEventListener('keydown', onKeyDown, true);
+    window.removeEventListener('keyup', onKeyUp, true);
+    
+    // 6) Удалить панель и стили
+    clearAllHighlights();
+    panel.remove();
+    styleEl.remove();
+
+    // 7) Сбросить флаги/кэши и перф-кэш
+    if (typeof resetPerfGuards === 'function') resetPerfGuards();
+    __dompickSelectorCache = null;
+    __dompickCachedElement = null;
+    window.__domPickerActive = false;
+  });
+
+  // --- Инициализация ---
+  // Запускает всю логику: очищает "хвосты", настраивает UI и добавляет обработчики событий.
+  
+  // Очистка "хвостов" от предыдущего запуска
+  document.querySelectorAll('.__dompick-modal, .__dompick-overlay').forEach(n => n.remove());
+  document.querySelectorAll('.__dompick-highlight').forEach(el => el.classList.remove('__dompick-highlight'));
+  document.body.classList.remove('__dompick-theme-js','__dompick-theme-cypress','__dompick-theme-transition');
+
+  // Сделаем панель перетаскиваемой за ручку
+  try {
+    const dragHandlePanel = panel.querySelector('#__dompick-drag-panel');
+    if (dragHandlePanel) {
+      // Для панели сохраняем фиксированное позиционирование (fixed)
+      makeDraggable(panel, dragHandlePanel, { constrainToViewport: true, keepFixed: true });
+      // Инициал: зафиксируем стартовые координаты, чтобы не "прыгало" при первом переносе
+      const r = panel.getBoundingClientRect();
+      panel.style.left = `${r.left}px`; panel.style.top = `${r.top}px`; panel.style.right = 'auto'; panel.style.bottom = 'auto';
     }
+  } catch {}
+
+  // Навешиваем события на кнопки переключения режима
+  const modeBtnCypress = panel.querySelector('#__dompick-mode-cypress');
+  const modeBtnJs = panel.querySelector('#__dompick-mode-js');
+  if (modeBtnCypress && modeBtnJs) {
+    modeBtnCypress.addEventListener('click', () => { 
+      __dompickMode = 'cypress'; 
+      applyModeStyles(); 
+    });
+    modeBtnJs.addEventListener('click', () => { 
+      __dompickMode = 'js'; 
+      applyModeStyles(); 
+    });
+    applyModeStyles();
   }
 
-  function onKeyUp(e) {
-    if (e.key === 'Control') {
-      isCtrlPressed = false;
-      // Выходим из режима выбора
-      deactivateSelectionMode();
-      // Убираем hover подсветку когда отпускаем Ctrl
-      if (currentHighlighted && currentHighlighted !== fixedHighlighted) {
-        removeHighlight(currentHighlighted);
-        currentHighlighted = null;
-      }
-    }
-  }
-
-  function onMouseOver(e) {
-    if (!isCtrlPressed) return;
-    
-    const target = snapTarget(e.target);
-    if (target === panel || panel.contains(target)) return;
-    if (target === fixedHighlighted) return; // не перекрываем зафиксированную подсветку
-    
-    // Убираем предыдущую hover подсветку
-    if (currentHighlighted && currentHighlighted !== fixedHighlighted) {
-      removeHighlight(currentHighlighted);
-    }
-    
-    currentHighlighted = target;
-    highlightElement(target);
-  }
-
-  function onMouseOut(e) {
-    if (!isCtrlPressed) return;
-    
-    const target = snapTarget(e.target);
-    if (currentHighlighted === target && target !== fixedHighlighted) {
-      removeHighlight(currentHighlighted);
-      currentHighlighted = null;
-    }
-  }
-
-  function onClick(e) {
-    if (!e.ctrlKey) return;
-    e.preventDefault();
-    e.stopImmediatePropagation();
-    
-    const target = snapTarget(e.target);
-    if (target === panel || panel.contains(target)) return;
-    
-    // Убираем предыдущую фиксированную подсветку
-    if (fixedHighlighted) {
-      removeHighlight(fixedHighlighted);
-    }
-    
-    // Фиксируем подсветку на кликнутом элементе
-    fixedHighlighted = target;
-    highlightElement(target);
-    
-    // Ctrl+клик - показываем селекторы
-    openModalFor(target);
-  }
-
-  // Добавляем все обработчики
-  // Клики/наведение теперь обрабатываются через Overlay в режиме выбора
+  // Добавляем все основные обработчики событий
   window.addEventListener('keydown', onKeyDown, true);
   window.addEventListener('keyup', onKeyUp, true);
+  // Клики и наведения теперь обрабатываются через activateSelectionMode/deactivateSelectionMode
+  
 })();
