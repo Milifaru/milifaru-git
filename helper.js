@@ -25,12 +25,14 @@
         targetEnoughBasic: Number(window.__dompickTargetEnoughBasic || 3),
         maxDescendantsForTextSearch: Number(window.__dompickMaxDescendantsForTextSearch || 400),
         domSizeSoftCap: Number(window.__dompickDomSizeSoftCap || 8000),
+        // Address Layer фичефлаг
+        addressPipeEnabled: Boolean(window.__dompickAddressPipeEnabled !== undefined ? window.__dompickAddressPipeEnabled : true),
       };
     } catch (_) {
       return { 
         debug: false, logLevel: 'info', buildBudgetMs: 5000, slowBuildThresholdMs: 2000, slowQueryThresholdMs: 30,
         textSearchEnabled: false, aggressiveEnabled: true, strategyBudgetMs: 150, targetEnoughBasic: 3,
-        maxDescendantsForTextSearch: 400, domSizeSoftCap: 4000
+        maxDescendantsForTextSearch: 400, domSizeSoftCap: 4000, addressPipeEnabled: true
       };
     }
   })();
@@ -47,6 +49,12 @@
   const __dompickVersion = 'v1.12'; // Версия UI
   let __dompickSelectorCache = null; // Глобальный кэш для селекторов в обоих режимах
   let __dompickCachedElement = null;
+  
+  // Address Layer: кэш для адресов
+  let __dompickAddressCache = null; // Глобальный кэш для адресов
+  
+  // Address Layer переменная
+  let __dompickAddressPipeEnabled = __dompickConfig.addressPipeEnabled;
 
   // --- Переменные для отладки и производительности ---
   const __perfStats = {
@@ -60,7 +68,832 @@
   const __queryCache = new Map(); // selector -> Array<Element>
 
   // =========================================================================
-  // РАЗДЕЛ 2: СТИЛИ И UI КОМПОНЕНТЫ
+  // РАЗДЕЛ 2: ADDRESS LAYER
+  // =========================================================================
+  
+  /**
+   * @typedef {Object} Address
+   * @property {'css'|'xpath'|'text'|'positional'} kind
+   * @property {string[]} path
+   * @property {Object=} constraints  // { text?, scopeSelector?, attrs? }
+   * @property {Object=} meta         // { score?, strategy? }
+   * @property {Element=} target
+   */
+
+  /**
+   * Address Layer: форматирует CSS Address в строку
+   * @param {Address} address
+   * @returns {string|null}
+   */
+  function toCss(address) {
+    if (!address || !address.path || !Array.isArray(address.path)) return null;
+    
+    switch (address.kind) {
+      case 'css':
+        return address.path.join(' ');
+      case 'positional':
+        return address.path.join(' ');
+      default:
+        return null;
+    }
+  }
+
+  /**
+   * Address Layer: форматирует XPath Address в строку
+   * @param {Address} address
+   * @returns {string|null}
+   */
+  function toXPath(address) {
+    if (!address || !address.path || !Array.isArray(address.path)) return null;
+    
+    switch (address.kind) {
+      case 'xpath':
+        return address.path.join('/');
+      case 'positional':
+        // Address Layer: конвертируем позиционные адреса в XPath
+        return address.path.join('/');
+      default:
+        return null;
+    }
+  }
+
+  /**
+   * Address Layer: форматирует Address в Cypress строку
+   * @param {Address} address
+   * @returns {string|null}
+   */
+  function toCypress(address) {
+    if (!address || !address.kind) return null;
+    
+    switch (address.kind) {
+      case 'css':
+        const cssSelector = toCss(address);
+        return cssSelector ? `cy.get('${cssSelector}')` : null;
+        
+      case 'xpath':
+        const xpathExpr = toXPath(address);
+        return xpathExpr ? `cy.xpath('${xpathExpr}')` : null;
+        
+      case 'text':
+        const text = address.constraints?.text;
+        if (!text) return null;
+        
+        const escapedText = text.replace(/'/g, "\\'");
+        const scopeSelector = address.constraints?.scopeSelector;
+        
+        if (scopeSelector) {
+          return `cy.get('${scopeSelector}').contains('${escapedText}')`;
+        } else {
+          return `cy.contains('${escapedText}')`;
+        }
+        
+      case 'positional':
+        // Address Layer: рендерим позиционные адреса в CSS
+        const positionalCss = toCss(address);
+        return positionalCss ? `cy.get('${positionalCss}')` : null;
+        
+      default:
+        return null;
+    }
+  }
+
+  /**
+   * Address Layer: форматирует Address в JS строку
+   * @param {Address} address
+   * @returns {string|null}
+   */
+  function toJs(address) {
+    if (!address || !address.kind) return null;
+    
+    switch (address.kind) {
+      case 'css':
+        const cssSelector = toCss(address);
+        return cssSelector ? `document.querySelector('${cssSelector}')` : null;
+        
+      case 'xpath':
+        const xpathExpr = toXPath(address);
+        return xpathExpr ? `document.evaluate('${xpathExpr}', document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue` : null;
+        
+      case 'text':
+        const text = address.constraints?.text;
+        if (!text) return null;
+        
+        const escapedText = text.replace(/'/g, "\\'");
+        const scopeSelector = address.constraints?.scopeSelector;
+        
+        if (scopeSelector) {
+          return `document.querySelector('${scopeSelector}').querySelector('*').textContent.includes('${escapedText}')`;
+        } else {
+          return `Array.from(document.querySelectorAll('*')).find(el => el.textContent.includes('${escapedText}'))`;
+        }
+        
+      case 'positional':
+        // Address Layer: рендерим позиционные адреса в CSS
+        const positionalCssJs = toCss(address);
+        return positionalCssJs ? `document.querySelector('${positionalCssJs}')` : null;
+        
+      default:
+        return null;
+    }
+  }
+
+  /**
+   * Address Layer: конвертирует Address в строку селектора для указанного режима
+   * @param {string} mode - 'cypress' | 'js'
+   * @param {Address} address
+   * @returns {string|null}
+   */
+  function addressToSelector(mode, address) {
+    if (!address || !address.kind) return null;
+    
+    switch (mode) {
+      case 'cypress':
+        return toCypress(address);
+      case 'js':
+        return toJs(address);
+      default:
+        return null;
+    }
+  }
+
+  /**
+   * Address Layer: универсальная проверка уникальности адреса
+   * @param {Address} address
+   * @param {Document|Element} within - контекст поиска (по умолчанию document)
+   * @returns {{unique: boolean, count: number}|null}
+   */
+  function isUniqueAddress(address, within = document) {
+    if (!address || !address.kind) return null;
+    
+    try {
+      switch (address.kind) {
+        case 'css':
+          const cssSelector = toCss(address);
+          if (!cssSelector) return null;
+          const cssElements = within.querySelectorAll(cssSelector);
+          return {
+            unique: cssElements.length === 1,
+            count: cssElements.length
+          };
+          
+        case 'xpath':
+          const xpathExpr = toXPath(address);
+          if (!xpathExpr) return null;
+          const xpathResult = document.evaluate(
+            xpathExpr, 
+            within, 
+            null, 
+            XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, 
+            null
+          );
+          return {
+            unique: xpathResult.snapshotLength === 1,
+            count: xpathResult.snapshotLength
+          };
+          
+        case 'text':
+        case 'positional':
+          // Address Layer: проверяем уникальность позиционных адресов как CSS
+          const positionalCss = toCss(address);
+          if (!positionalCss) return null;
+          const positionalElements = within.querySelectorAll(positionalCss);
+          return {
+            unique: positionalElements.length === 1,
+            count: positionalElements.length
+          };
+          
+        default:
+          return null;
+      }
+    } catch (error) {
+      __dlog('warn', `Address Layer: ошибка проверки уникальности адреса: ${error.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Address Layer: генерация текстовых адресов
+   * @param {Element} el
+   * @returns {Address[]}
+   */
+  function byTextAddress(el) {
+    const addresses = [];
+    const texts = getAllTexts(el);
+    
+    // Обрабатываем все найденные тексты
+    for (const text of texts) {
+      if (!isGoodTextForContains(text)) continue;
+      
+      // Глобально уникальный текст
+      if (isUniqueByText(el, text)) {
+        addresses.push({
+          kind: 'text',
+          path: [text],
+          constraints: { text },
+          meta: { strategy: 'byTextAddress', score: 85 },
+          target: el
+        });
+      }
+      
+      // Уникален среди тега
+      const tag = el.tagName.toLowerCase();
+      if (isUniqueByText(el, text, tag)) {
+        addresses.push({
+          kind: 'text',
+          path: [tag, text],
+          constraints: { text, tag },
+          meta: { strategy: 'byTextAddress', score: 80 },
+          target: el
+        });
+      }
+      
+      // Специальные контейнеры (видимый)
+      const specialContainer = el.closest('.datepicker, .modal, .modal-body, .modal-content, .modal-dialog, .dropdown, .popup, .overlay, .sidebar, .panel');
+      if (specialContainer) {
+        const containerClass = specialContainer.classList[0];
+        if (containerClass && isUniqueByTextInParent(el, text, specialContainer)) {
+          addresses.push({
+            kind: 'text',
+            path: [containerClass, text],
+            constraints: { text, scopeSelector: `.${containerClass}` },
+            meta: { strategy: 'byTextAddress', score: 75 },
+            target: el
+          });
+        }
+      }
+      
+      // Уникальный контекст - упрощенная версия
+      if (!isUniqueByText(el, text)) {
+        // Address Layer: findMinimalUniqueContext не реализована, пропускаем
+      }
+    }
+    
+    return addresses;
+  }
+
+  /**
+   * Address Layer: генерация позиционных адресов (nth-child)
+   * @param {Element} el
+   * @returns {Address[]}
+   */
+  function byNthChildAddress(el) {
+    const addresses = [];
+    const parent = el.parentElement;
+    if (!parent) return addresses;
+    
+    const tag = el.tagName.toLowerCase();
+    const siblings = [...parent.children];
+    const index = siblings.indexOf(el) + 1;
+    
+    // nth-child по позиции среди всех детей
+    const nthChildPath = [`${tag}:nth-child(${index})`];
+    addresses.push({
+      kind: 'positional',
+      path: nthChildPath,
+      constraints: { tag, index, type: 'nth-child' },
+      meta: { strategy: 'byNthChildAddress', score: 75 },
+      target: el
+    });
+    
+    // nth-of-type по позиции среди элементов того же типа
+    const sameTypeSiblings = siblings.filter(s => s.tagName === el.tagName);
+    if (sameTypeSiblings.length > 1) {
+      const typeIndex = sameTypeSiblings.indexOf(el) + 1;
+      const nthOfTypePath = [`${tag}:nth-of-type(${typeIndex})`];
+      addresses.push({
+        kind: 'positional',
+        path: nthOfTypePath,
+        constraints: { tag, index: typeIndex, type: 'nth-of-type' },
+        meta: { strategy: 'byNthChildAddress', score: 70 },
+        target: el
+      });
+    }
+    
+    // first-child, last-child
+    if (index === 1) {
+      const firstChildPath = [`${tag}:first-child`];
+      addresses.push({
+        kind: 'positional',
+        path: firstChildPath,
+        constraints: { tag, type: 'first-child' },
+        meta: { strategy: 'byNthChildAddress', score: 80 },
+        target: el
+      });
+    }
+    
+    if (index === siblings.length) {
+      const lastChildPath = [`${tag}:last-child`];
+      addresses.push({
+        kind: 'positional',
+        path: lastChildPath,
+        constraints: { tag, type: 'last-child' },
+        meta: { strategy: 'byNthChildAddress', score: 80 },
+        target: el
+      });
+    }
+    
+    return addresses;
+  }
+
+  /**
+   * Address Layer: генерация позиционных адресов с родительскими элементами
+   * @param {Element} el
+   * @returns {Address[]}
+   */
+  function byParentWithNthAddress(el) {
+    const addresses = [];
+    const parent = el.parentElement;
+    if (!parent) return addresses;
+    
+    const tag = el.tagName.toLowerCase();
+    const siblings = [...parent.children];
+    const index = siblings.indexOf(el) + 1;
+    
+    // Поиск родителей с ID или классами
+    let currentParent = parent;
+    let depth = 0;
+    
+    while (currentParent && depth < 3) {
+      // Родитель с ID
+      if (currentParent.id) {
+        addresses.push({
+          kind: 'positional',
+          path: [`#${esc(currentParent.id)} > ${tag}:nth-child(${index})`],
+          constraints: { parentId: currentParent.id, tag, index, type: 'nth-child' },
+          meta: { strategy: 'byParentWithNthAddress', score: 85 },
+          target: el
+        });
+      }
+      
+      // Родитель с классами
+      if (currentParent.classList && currentParent.classList.length > 0) {
+        const classes = [...currentParent.classList].filter(c => 
+          c && 
+          !looksDynamic(c) && 
+          !c.startsWith('__dompick')
+        ).slice(0, 2);
+        if (classes.length > 0) {
+          addresses.push({
+            kind: 'positional',
+            path: [`.${classes.map(c => esc(c)).join('.')} > ${tag}:nth-child(${index})`],
+            constraints: { parentClasses: classes, tag, index, type: 'nth-child' },
+            meta: { strategy: 'byParentWithNthAddress', score: 80 },
+            target: el
+          });
+        }
+      }
+      
+      currentParent = currentParent.parentElement;
+      depth++;
+    }
+    
+    return addresses;
+  }
+
+  /**
+   * Address Layer: генерация позиционных адресов для календарных элементов
+   * @param {Element} el
+   * @returns {Address[]}
+   */
+  function byCalendarSelectorsAddress(el) {
+    const addresses = [];
+    const tag = el.tagName.toLowerCase();
+    
+    // Проверяем, находится ли элемент в календаре
+    const calendarContainer = el.closest('.calendar, .datepicker, .date-picker, .timepicker, .time-picker, [role="grid"], [role="calendar"]');
+    if (!calendarContainer) return addresses;
+    
+    // Получаем позицию в календаре
+    const rows = calendarContainer.querySelectorAll('tr, .calendar-row, .date-row');
+    const cells = calendarContainer.querySelectorAll('td, .calendar-cell, .date-cell, [role="gridcell"]');
+    
+    if (rows.length > 0 && cells.length > 0) {
+      // Находим строку и ячейку
+      let rowIndex = -1;
+      let cellIndex = -1;
+      
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i];
+        const rowCells = row.querySelectorAll('td, .calendar-cell, .date-cell, [role="gridcell"]');
+        const cellInRow = row.querySelector(tag);
+        if (cellInRow === el) {
+          rowIndex = i + 1;
+          cellIndex = [...rowCells].indexOf(el) + 1;
+          break;
+        }
+      }
+      
+      if (rowIndex > 0 && cellIndex > 0) {
+        let calendarSelector = calendarContainer.tagName.toLowerCase();
+        if (calendarContainer.className) {
+          const classes = [...calendarContainer.classList].filter(c => c && !looksDynamic(c));
+          if (classes.length > 0) {
+            calendarSelector = `${calendarSelector}.${classes.map(c => esc(c)).join('.')}`;
+          }
+        }
+        
+        addresses.push({
+          kind: 'positional',
+          path: [`${calendarSelector} tr:nth-child(${rowIndex}) ${tag}:nth-child(${cellIndex})`],
+          constraints: { calendarType: 'grid', rowIndex, cellIndex, tag },
+          meta: { strategy: 'byCalendarSelectorsAddress', score: 75 },
+          target: el
+        });
+      }
+    }
+    
+    return addresses;
+  }
+
+  /**
+   * Address Layer: генерация агрессивных fallback адресов
+   * @param {Element} el
+   * @returns {Address[]}
+   */
+  function generateAggressiveFallbacksAddress(el) {
+    const addresses = [];
+    const tag = el.tagName.toLowerCase();
+    
+    // 1. Селекторы с уникальными родителями + nth-child
+    const parentNthAddresses = generateParentNthAddresses(el);
+    addresses.push(...parentNthAddresses);
+
+    // 2. Селекторы по позиции в документе
+    const allSameTagElements = document.querySelectorAll(tag);
+    const elementIndex = [...allSameTagElements].indexOf(el);
+    if (elementIndex >= 0) {
+      const nthPath = [`${tag}:nth-of-type(${elementIndex + 1})`];
+      addresses.push({
+        kind: 'positional',
+        path: nthPath,
+        constraints: { tag, globalIndex: elementIndex + 1, type: 'nth-of-type' },
+        meta: { strategy: 'generateAggressiveFallbacksAddress', score: 60 },
+        target: el
+      });
+    }
+    
+    // 3. Селекторы по атрибутам
+    if (el.attributes) {
+      for (const {name, value} of el.attributes) {
+        if (name && value && value.length < 50 && !looksDynamic(value)) {
+          if (name === 'class' && value.includes('__dompick')) continue;
+          
+          const attrPath = [`[${name}="${esc(value)}"]`];
+          addresses.push({
+            kind: 'css',
+            path: attrPath,
+            constraints: { attrName: name, attrValue: value },
+            meta: { strategy: 'generateAggressiveFallbacksAddress', score: 65 },
+            target: el
+          });
+          
+          const tagAttrPath = [`${tag}[${name}="${esc(value)}"]`];
+          addresses.push({
+            kind: 'css',
+            path: tagAttrPath,
+            constraints: { tag, attrName: name, attrValue: value },
+            meta: { strategy: 'generateAggressiveFallbacksAddress', score: 70 },
+            target: el
+          });
+        }
+      }
+    }
+    
+    // 4. Селекторы по классам
+    if (el.classList && el.classList.length > 0) {
+      const stableClasses = [...el.classList].filter(c => 
+        c && 
+        !looksDynamic(c) && 
+        !c.startsWith('__dompick') && 
+        c.length > 1
+      );
+      
+      for (const cls of stableClasses.slice(0, 3)) {
+        const classPath = [`.${esc(cls)}`];
+        addresses.push({
+          kind: 'css',
+          path: classPath,
+          constraints: { className: cls },
+          meta: { strategy: 'generateAggressiveFallbacksAddress', score: 75 },
+          target: el
+        });
+        
+        const tagClassPath = [`${tag}.${esc(cls)}`];
+        addresses.push({
+          kind: 'css',
+          path: tagClassPath,
+          constraints: { tag, className: cls },
+          meta: { strategy: 'generateAggressiveFallbacksAddress', score: 80 },
+          target: el
+        });
+      }
+    }
+    
+    // 5. Простой селектор по тегу
+    const tagPath = [tag];
+    addresses.push({
+      kind: 'css',
+      path: tagPath,
+      constraints: { tag },
+      meta: { strategy: 'generateAggressiveFallbacksAddress', score: 50 },
+      target: el
+    });
+    
+    // 6. Абсолютный CSS-путь
+    const absolutePath = buildAbsoluteCssPath(el);
+    const absoluteSegments = absolutePath.split(' > ');
+    addresses.push({
+      kind: 'css',
+      path: absoluteSegments,
+      constraints: { type: 'absolute-path' },
+      meta: { strategy: 'generateAggressiveFallbacksAddress', score: 40 },
+      target: el
+    });
+    
+    return addresses;
+  }
+
+  /**
+   * Address Layer: генерация суперагрессивных fallback адресов
+   * @param {Element} el
+   * @returns {Address[]}
+   */
+  function generateSuperAggressiveFallbacksAddress(el) {
+    const addresses = [];
+    
+    // Используем ту же логику, что и generateAggressiveFallbacksAddress, но с более низкими score
+    const aggressiveAddresses = generateAggressiveFallbacksAddress(el);
+    for (const addr of aggressiveAddresses) {
+      addresses.push({
+        ...addr,
+        meta: { 
+          ...addr.meta, 
+          strategy: 'generateSuperAggressiveFallbacksAddress',
+          score: Math.max(20, addr.meta.score - 20) // Снижаем score на 20
+        }
+      });
+    }
+    
+    return addresses;
+  }
+
+  /**
+   * Address Layer: генерация адресов с уникальными родителями + nth-child
+   * @param {Element} el
+   * @returns {Address[]}
+   */
+  function generateParentNthAddresses(el) {
+    const addresses = [];
+    const tag = el.tagName.toLowerCase();
+    let currentParent = el.parentElement;
+    let depth = 0;
+    const maxDepth = 6;
+    
+    while (currentParent && depth < maxDepth) {
+      const siblings = [...currentParent.children];
+      const elementIndex = siblings.indexOf(el) + 1;
+      
+      // Родитель с ID + nth-child
+      if (currentParent.id) {
+        const parentId = `#${esc(currentParent.id)}`;
+        if (document.querySelectorAll(parentId).length === 1) {
+          addresses.push({
+            kind: 'positional',
+            path: [`${parentId} > ${tag}:nth-child(${elementIndex})`],
+            constraints: { parentId: currentParent.id, tag, index: elementIndex, type: 'nth-child' },
+            meta: { strategy: 'generateParentNthAddresses', score: 90 },
+            target: el
+          });
+        }
+      }
+      
+      currentParent = currentParent.parentElement;
+      depth++;
+    }
+    
+    return addresses;
+  }
+
+  /**
+   * Address Layer: собирает все возможные адреса
+   * @param {Element} el
+   * @returns {Address[]}
+   */
+  function collectAllAddresses(el) {
+    const allAddresses = [];
+    const candidatesMap = new Map();
+
+    // Добавляем адреса порциями, проверяя бюджет
+    const addBatch = (batch) => {
+      if (!batch || !Array.isArray(batch)) {
+        __dlog('debug', `Address Layer: addBatch получил невалидный batch:`, batch);
+        return;
+      }
+      
+      for (const addr of batch) {
+        if (budgetExpired()) break;
+        
+        if (!addr || !addr.kind || !addr.path || !Array.isArray(addr.path)) {
+          __dlog('debug', `Address Layer: пропускаем невалидный адрес:`, addr);
+          continue;
+        }
+        
+        const addrKey = `${addr.kind}:${addr.path.join('|')}`;
+        if (!candidatesMap.has(addrKey)) {
+          // Проверяем уникальность адреса
+          const uniqueness = isUniqueAddress(addr, document);
+          if (uniqueness && uniqueness.unique) {
+            __dlog('debug', `Address Layer: адрес уникален (count: ${uniqueness.count})`);
+            addr.target = el;
+            candidatesMap.set(addrKey, addr);
+            allAddresses.push(addr);
+          } else {
+            __dlog('debug', `Address Layer: адрес не уникален (count: ${uniqueness?.count || 0})`);
+          }
+        }
+      }
+    };
+
+    // 1) Самые быстрые стратегии
+    const stableScopeResults = __timeit('byStableScopePath', () => byStableScopePath(el));
+    if (stableScopeResults && stableScopeResults.length > 0) {
+      const stableScopeAddresses = stableScopeResults.map(result => ({
+        kind: 'css',
+        path: [result.sel],
+        meta: { strategy: 'byStableScopePath', score: result.score || 0 },
+        target: el
+      }));
+      addBatch(stableScopeAddresses);
+    }
+
+    const classCombosResults = __timeit('byClassCombos', () => byClassCombos(el));
+    if (classCombosResults && classCombosResults.length > 0) {
+      const classCombosAddresses = classCombosResults.map(result => ({
+        kind: 'css',
+        path: [result.sel],
+        meta: { strategy: 'byClassCombos', score: result.score || 0 },
+        target: el
+      }));
+      addBatch(classCombosAddresses);
+    }
+    
+    // 2) Быстрые стратегии с ID и атрибутами
+    const idResults = __timeit('byId', () => byId(el));
+    if (idResults && idResults.length > 0) {
+      const idAddresses = idResults.map(result => ({
+        kind: 'css',
+        path: [result.sel],
+        meta: { strategy: 'byId', score: result.score },
+        target: el
+      }));
+      addBatch(idAddresses);
+    }
+
+    const attrResults = __timeit('byAttr', () => byAttr(el));
+    if (attrResults && attrResults.length > 0) {
+      const attrAddresses = attrResults.map(result => ({
+        kind: 'css',
+        path: [result.sel],
+        meta: { strategy: 'byAttr', score: result.score },
+        target: el
+      }));
+      addBatch(attrAddresses);
+    }
+
+    // 3) XPath стратегии
+    if (__canRun('byXPath', 2)) {
+      const xpathResults = __timeit('byXPath', () => byXPath(el));
+      if (xpathResults && xpathResults.length > 0) {
+        const xpathAddresses = xpathResults.map(result => ({
+          kind: 'xpath',
+          path: [result.sel],
+          meta: { strategy: 'byXPath', score: result.score },
+          target: el
+        }));
+        addBatch(xpathAddresses);
+      }
+    }
+
+    // 4) Текстовые стратегии
+    if (__dompickConfig.textSearchEnabled) {
+      const descendants = __countDescendants(el, __dompickConfig.maxDescendantsForTextSearch + 1);
+      if (descendants <= __dompickConfig.maxDescendantsForTextSearch) {
+        if (__canRun('byTextAddress', 2)) {
+          const textAddresses = __timeit('byTextAddress', () => byTextAddress(el));
+          if (textAddresses && textAddresses.length > 0) {
+            addBatch(textAddresses);
+          }
+        }
+      } else {
+        __dlog('info', `📝 текстовые стратегии: пропуск (${descendants} потомков > ${__dompickConfig.maxDescendantsForTextSearch})`);
+      }
+    }
+
+    // 5) Позиционные стратегии
+    if (!budgetExpired()) {
+      const nthAddresses = __timeit('byNthChildAddress', () => byNthChildAddress(el));
+      if (nthAddresses && nthAddresses.length > 0) {
+        addBatch(nthAddresses);
+      }
+    }
+    if (!budgetExpired()) {
+      const parentNthAddresses = __timeit('byParentWithNthAddress', () => byParentWithNthAddress(el));
+      if (parentNthAddresses && parentNthAddresses.length > 0) {
+        addBatch(parentNthAddresses);
+      }
+    }
+    if (!budgetExpired()) {
+      const calendarAddresses = __timeit('byCalendarSelectorsAddress', () => byCalendarSelectorsAddress(el));
+      if (calendarAddresses && calendarAddresses.length > 0) {
+        addBatch(calendarAddresses);
+      }
+    }
+
+    // 6) Агрессивные стратегии
+    if (__dompickConfig.aggressiveEnabled) {
+      const totalDescendants = __countDescendants(document.body, __dompickConfig.domSizeSoftCap + 1);
+      if (totalDescendants <= __dompickConfig.domSizeSoftCap) {
+        if (__canRun('generateAggressiveFallbacksAddress', 3)) {
+          const aggressiveAddresses = __timeit('generateAggressiveFallbacksAddress', () => generateAggressiveFallbacksAddress(el));
+          if (aggressiveAddresses && aggressiveAddresses.length > 0) {
+            addBatch(aggressiveAddresses);
+          }
+        }
+        if (__canRun('generateSuperAggressiveFallbacksAddress', 4)) {
+          const superAggressiveAddresses = __timeit('generateSuperAggressiveFallbacksAddress', () => generateSuperAggressiveFallbacksAddress(el));
+          if (superAggressiveAddresses && superAggressiveAddresses.length > 0) {
+            addBatch(superAggressiveAddresses);
+          }
+        }
+      } else {
+        __dlog('info', `🔥 агрессивные стратегии: пропуск (DOM слишком большой: ${totalDescendants} > ${__dompickConfig.domSizeSoftCap})`);
+      }
+    }
+
+    return allAddresses;
+  }
+
+  /**
+   * Address Layer: категоризует адреса по группам
+   * @param {Address[]} addresses
+   * @returns {Object}
+   */
+  function categorizeAddresses(addresses) {
+    const groups = {
+      basic: [],      // Без .contains и nth-child
+      contains: [],   // С .contains
+      nth: [],        // С nth-child
+      xpath: [],      // XPath
+      aggressive: []  // Агрессивные fallback
+    };
+
+    for (const addr of addresses) {
+      switch (addr.kind) {
+        case 'xpath':
+          groups.xpath.push(addr);
+          break;
+        case 'text':
+          groups.contains.push(addr);
+          break;
+        case 'positional':
+          groups.nth.push(addr);
+          break;
+        case 'css':
+          // Проверяем, содержит ли CSS селектор nth-child
+          const cssStr = toCss(addr);
+          if (cssStr && (cssStr.includes('nth-child') || cssStr.includes('nth-of-type'))) {
+            groups.nth.push(addr);
+          } else {
+            groups.basic.push(addr);
+          }
+          break;
+        default:
+          groups.aggressive.push(addr);
+      }
+    }
+
+    // Сортировка по score
+    const sortByScore = (a, b) => {
+      const aScore = a.meta?.score || 0;
+      const bScore = b.meta?.score || 0;
+      if (aScore !== bScore) return bScore - aScore;
+      // При равенстве — более короткий лучше
+      const aLength = (a.path && Array.isArray(a.path) ? a.path.join('') : '').length;
+      const bLength = (b.path && Array.isArray(b.path) ? b.path.join('') : '').length;
+      return aLength - bLength;
+    };
+
+    groups.basic.sort(sortByScore);
+    groups.contains.sort(sortByScore);
+    groups.nth.sort(sortByScore);
+    groups.xpath.sort(sortByScore);
+    groups.aggressive.sort(sortByScore);
+
+    return groups;
+  }
+
+  // =========================================================================
+  // РАЗДЕЛ 4: СТИЛИ И UI КОМПОНЕНТЫ
   // =========================================================================
   
   // --- Утилита для перетаскивания элемента ---
@@ -965,14 +1798,60 @@ function makeDraggable(targetEl, handleEl, options = {}) {
         const availableActions = getAvailableActions(el);
         const cachedGroups = __dompickSelectorCache[__dompickMode] || __dompickSelectorCache.cypress; // fallback
 
-        createSelectorGroup(groupsContainer, 'Базовые селекторы CSS', cachedGroups.basicSelectors, cachedGroups.moreBasic, availableActions, 'basic');
-        const containsTitle = (__dompickMode === 'js') ? 'Селекторы по тексту' : 'Селекторы с .contains';
-     
-       createSelectorGroup(groupsContainer, containsTitle, cachedGroups.containsSelectors, cachedGroups.moreContains, availableActions, 'contains');
-        createSelectorGroup(groupsContainer, 'Позиционные селекторы', cachedGroups.nthSelectors, cachedGroups.moreNth, availableActions, 'nth');
-        createSelectorGroup(groupsContainer, 'XPath селекторы', cachedGroups.xpathSelectors || [], cachedGroups.moreXPath || [], availableActions, 'xpath');
-        if (cachedGroups.aggressive && cachedGroups.aggressive.length > 0) {
-          createSelectorGroup(groupsContainer, 'Агрессивные селекторы', cachedGroups.aggressive.slice(0, 5), cachedGroups.aggressive.slice(5), availableActions, 'aggressive');
+        // Address Layer: функция форматирования адресов для текущего режима
+        const formatAddresses = (addresses) => {
+          if (!addresses || !Array.isArray(addresses)) return [];
+          return addresses.map(addr => {
+            const formatted = addressToSelector(__dompickMode, addr);
+            if (!formatted) {
+              __dlog('debug', 'Address Layer: не удалось отформатировать адрес:', addr);
+              return null;
+            }
+            return {
+              sel: formatted,
+              isCypress: __dompickMode === 'cypress',
+              isJs: __dompickMode === 'js',
+              score: addr.meta?.score,
+              __targetEl: el,
+              __address: addr
+            };
+          }).filter(Boolean); // Убираем null значения
+        };
+
+        // Address Layer: если включен address pipe, форматируем адреса перед отображением
+        if (__dompickAddressPipeEnabled) {
+          createSelectorGroup(groupsContainer, 'Базовые селекторы CSS', formatAddresses(cachedGroups.basicSelectors), formatAddresses(cachedGroups.moreBasic), availableActions, 'basic');
+          const containsTitle = (__dompickMode === 'js') ? 'Селекторы по тексту' : 'Селекторы с .contains';
+          createSelectorGroup(groupsContainer, containsTitle, formatAddresses(cachedGroups.containsSelectors), formatAddresses(cachedGroups.moreContains), availableActions, 'contains');
+          createSelectorGroup(groupsContainer, 'Позиционные селекторы', formatAddresses(cachedGroups.nthSelectors), formatAddresses(cachedGroups.moreNth), availableActions, 'nth');
+          createSelectorGroup(groupsContainer, 'XPath селекторы', formatAddresses(cachedGroups.xpathSelectors || []), formatAddresses(cachedGroups.moreXPath || []), availableActions, 'xpath');
+          if (cachedGroups.aggressive && cachedGroups.aggressive.length > 0) {
+            createSelectorGroup(groupsContainer, 'Агрессивные селекторы', formatAddresses(cachedGroups.aggressive.slice(0, 5)), formatAddresses(cachedGroups.aggressive.slice(5)), availableActions, 'aggressive');
+          }
+        } else {
+          // Обычный режим без Address Layer
+          createSelectorGroup(groupsContainer, 'Базовые селекторы CSS', cachedGroups.basicSelectors, cachedGroups.moreBasic, availableActions, 'basic');
+          const containsTitle = (__dompickMode === 'js') ? 'Селекторы по тексту' : 'Селекторы с .contains';
+          createSelectorGroup(groupsContainer, containsTitle, cachedGroups.containsSelectors, cachedGroups.moreContains, availableActions, 'contains');
+          createSelectorGroup(groupsContainer, 'Позиционные селекторы', cachedGroups.nthSelectors, cachedGroups.moreNth, availableActions, 'nth');
+          createSelectorGroup(groupsContainer, 'XPath селекторы', cachedGroups.xpathSelectors || [], cachedGroups.moreXPath || [], availableActions, 'xpath');
+          if (cachedGroups.aggressive && cachedGroups.aggressive.length > 0) {
+            createSelectorGroup(groupsContainer, 'Агрессивные селекторы', cachedGroups.aggressive.slice(0, 5), cachedGroups.aggressive.slice(5), availableActions, 'aggressive');
+          }
+        }
+        
+        // Если нет кэша для противоположного режима, генерируем его в фоне
+        const oppositeMode = __dompickMode === 'cypress' ? 'js' : 'cypress';
+        if (!__dompickSelectorCache[oppositeMode]) {
+          setTimeout(() => {
+            const originalMode = __dompickMode;
+            __dompickMode = oppositeMode;
+            resetPerfGuards();
+            const oppositeGroups = buildCandidates(el);
+            __dompickMode = originalMode;
+            __dompickSelectorCache[oppositeMode] = oppositeGroups;
+            resetPerfGuards();
+          }, 100);
         }
       }, 50);
       return;
@@ -1033,26 +1912,84 @@ function makeDraggable(targetEl, handleEl, options = {}) {
         }
       }
       
-      // Инициализируем кэш
+      // Инициализируем кэш для текущего режима
       __dompickSelectorCache = {
         [__dompickMode]: groups
       };
       __dompickCachedElement = el;
       
+      // Address Layer: если включен address pipe, сохраняем адреса в отдельный кэш
+      if (__dompickAddressPipeEnabled) {
+        __dompickAddressCache = groups;
+      }
+      
+      // Генерируем селекторы для противоположного режима в фоне
+      const oppositeMode = __dompickMode === 'cypress' ? 'js' : 'cypress';
+      const originalMode = __dompickMode;
+      
+      // Временно переключаем режим для генерации
+      __dompickMode = oppositeMode;
       resetPerfGuards();
+      const oppositeGroups = buildCandidates(el);
+      __dompickMode = originalMode; // Возвращаем исходный режим
+      
+      // Сохраняем селекторы для противоположного режима в кэш
+      __dompickSelectorCache[oppositeMode] = oppositeGroups;
+      
+      if (__dompickConfig.debug) {
+        __dlog('info', `✅ Сгенерированы селекторы для режима ${oppositeMode}: ${oppositeGroups.basicSelectors.length} базовых, ${oppositeGroups.containsSelectors.length} текстовых, ${oppositeGroups.nthSelectors.length} позиционных`);
+      }
+      
+      resetPerfGuards();
+
+      // Address Layer: функция форматирования адресов для текущего режима
+      const formatAddresses = (addresses) => {
+        if (!addresses || !Array.isArray(addresses)) return [];
+        return addresses.map(addr => {
+          const formatted = addressToSelector(__dompickMode, addr);
+          if (!formatted) {
+            __dlog('debug', 'Address Layer: не удалось отформатировать адрес:', addr);
+            return null;
+          }
+          return {
+            sel: formatted,
+            isCypress: __dompickMode === 'cypress',
+            isJs: __dompickMode === 'js',
+            score: addr.meta?.score,
+            __targetEl: el,
+            __address: addr
+          };
+        }).filter(Boolean); // Убираем null значения
+      };
 
       const availableActions = getAvailableActions(el);
       const loading = groupsContainer.querySelector('#__dompick-loading');
       if (loading) loading.remove();
-      createSelectorGroup(groupsContainer, 'Базовые селекторы CSS', groups.basicSelectors, groups.moreBasic, availableActions, 'basic');
-      const containsTitle = (__dompickMode === 'js') ? 'Селекторы по тексту' : 'Селекторы с .contains';
-      createSelectorGroup(groupsContainer, containsTitle, groups.containsSelectors, groups.moreContains, availableActions, 'contains');
-      createSelectorGroup(groupsContainer, 'Позиционные селекторы', groups.nthSelectors, groups.moreNth, availableActions, 'nth');
-      createSelectorGroup(groupsContainer, 'XPath селекторы', groups.xpathSelectors || [], groups.moreXPath || [], availableActions, 'xpath');
+      
+      // Address Layer: если включен address pipe, форматируем адреса перед отображением
+      if (__dompickAddressPipeEnabled) {
+        createSelectorGroup(groupsContainer, 'Базовые селекторы CSS', formatAddresses(groups.basicSelectors), formatAddresses(groups.moreBasic), availableActions, 'basic');
+        const containsTitle = (__dompickMode === 'js') ? 'Селекторы по тексту' : 'Селекторы с .contains';
+        createSelectorGroup(groupsContainer, containsTitle, formatAddresses(groups.containsSelectors), formatAddresses(groups.moreContains), availableActions, 'contains');
+        createSelectorGroup(groupsContainer, 'Позиционные селекторы', formatAddresses(groups.nthSelectors), formatAddresses(groups.moreNth), availableActions, 'nth');
+        createSelectorGroup(groupsContainer, 'XPath селекторы', formatAddresses(groups.xpathSelectors || []), formatAddresses(groups.moreXPath || []), availableActions, 'xpath');
 
-      // Если есть агрессивные — тоже показываем
-      if (groups.aggressive && groups.aggressive.length > 0) {
-        createSelectorGroup(groupsContainer, 'Агрессивные селекторы', groups.aggressive.slice(0, 5), groups.aggressive.slice(5), availableActions, 'aggressive');
+        // Если есть агрессивные — тоже показываем
+        if (groups.aggressive && groups.aggressive.length > 0) {
+          createSelectorGroup(groupsContainer, 'Агрессивные селекторы', formatAddresses(groups.aggressive.slice(0, 5)), formatAddresses(groups.aggressive.slice(5)), availableActions, 'aggressive');
+        }
+      } else {
+        // Обычный режим без Address Layer
+        createSelectorGroup(groupsContainer, 'Базовые селекторы CSS', groups.basicSelectors, groups.moreBasic, availableActions, 'basic');
+        const containsTitle = (__dompickMode === 'js') ? 'Селекторы по тексту' : 'Селекторы с .contains';
+        createSelectorGroup(groupsContainer, containsTitle, groups.containsSelectors, groups.moreContains, availableActions, 'contains');
+        createSelectorGroup(groupsContainer, 'Позиционные селекторы', groups.nthSelectors, groups.moreNth, availableActions, 'nth');
+        createSelectorGroup(groupsContainer, 'XPath селекторы', groups.xpathSelectors || [], groups.moreXPath || [], availableActions, 'xpath');
+
+        // Если есть агрессивные — тоже показываем
+        if (groups.aggressive && groups.aggressive.length > 0) {
+          createSelectorGroup(groupsContainer, 'Агрессивные селекторы', groups.aggressive.slice(0, 5), groups.aggressive.slice(5), availableActions, 'aggressive');
+        }
       }
 
       // ГАРАНТИЯ: если ни одного селектора не сгенерировалось — формируем абсолютный CSS‑путь
@@ -1138,6 +2075,11 @@ function makeDraggable(targetEl, handleEl, options = {}) {
 
   // Добавление строки с селектором в группу
   function addSelectorToGroup(container, selector, availableActions, number) {
+    // Address Layer: проверяем валидность селектора
+    if (!selector || !selector.sel) {
+      __dlog('debug', 'Address Layer: addSelectorToGroup получил невалидный селектор:', selector);
+      return;
+    }
     const selectorRow = document.createElement('div');
     selectorRow.className = '__dompick-selector-row';
     selectorRow.style.display = 'grid';
@@ -1147,6 +2089,24 @@ function makeDraggable(targetEl, handleEl, options = {}) {
     selectorRow.style.marginBottom = '8px';
     
     const buildBaseForMode = () => {
+      // Address Layer: если есть адрес, форматируем его для текущего режима
+      if (__dompickAddressPipeEnabled && selector.__address) {
+        const formatted = addressToSelector(__dompickMode, selector.__address);
+        if (formatted) return formatted;
+      }
+      
+      // Address Layer: проверяем, что у нас есть валидный селектор
+      if (!selector.sel) {
+        __dlog('debug', 'Address Layer: buildBaseForMode получил селектор без sel:', selector);
+        return '// Ошибка: не удалось сгенерировать селектор';
+      }
+      
+      // Address Layer: дополнительная проверка на валидность строки
+      if (typeof selector.sel !== 'string') {
+        __dlog('debug', 'Address Layer: buildBaseForMode получил селектор с невалидным sel:', selector.sel);
+        return '// Ошибка: невалидный селектор';
+      }
+      
       // ✅ XPath: показываем корректные выражения для текущего режима
       if (selector.isXPath) {
         if (__dompickMode === 'js') {
@@ -1163,7 +2123,7 @@ function makeDraggable(targetEl, handleEl, options = {}) {
         return `document.querySelector('${selector.sel}')`;
       } else {
         if (selector.isCypress) return selector.sel;
-        if (selector.isJs || selector.sel.includes('document.querySelector') || selector.sel.includes('Array.from')) {
+        if (selector.isJs || (selector.sel && (selector.sel.includes('document.querySelector') || selector.sel.includes('Array.from')))) {
           return convertJsToCypressBase(selector.sel);
         }
         return `cy.get('${selector.sel}')`;
@@ -1188,7 +2148,13 @@ function makeDraggable(targetEl, handleEl, options = {}) {
     selectorPart.querySelector('div').appendChild(codeElement);
 
     // Бейдж рейтинга (0..100), цвет от красного к зелёному
-    const rawScore = (typeof computeSelectorScore === 'function') ? computeSelectorScore(selector, selector.__targetEl || null) : 0;
+    let rawScore = 0;
+    if (__dompickAddressPipeEnabled && selector.__address && selector.__address.meta && selector.__address.meta.score !== undefined) {
+      // Address Layer: используем score из адреса если доступен
+      rawScore = selector.__address.meta.score;
+    } else if (typeof computeSelectorScore === 'function') {
+      rawScore = computeSelectorScore(selector, selector.__targetEl || null);
+    }
     const normalized = Math.max(0, Math.min(100, Math.round(50 + 50 * Math.tanh(rawScore / 80)))) ;
     const hue = Math.round((normalized / 100) * 120); // 0 (red) -> 120 (green)
     const ratingBadge = document.createElement('div');
@@ -1293,6 +2259,9 @@ function makeDraggable(targetEl, handleEl, options = {}) {
     }
     
     // Обновляем содержимое модального окна, если оно открыто
+    if (__dompickConfig.debug) {
+      __dlog('info', `🔄 Переключение режима на ${__dompickMode}, обновление модального окна...`);
+    }
     updateModalContent();
 
     // Убираем класс перехода через некоторое время
@@ -1323,8 +2292,43 @@ function makeDraggable(targetEl, handleEl, options = {}) {
       title.textContent = `Селекторы для ${__dompickMode === 'js' ? 'JS' : 'Cypress'}`;
     }
     
+    // Address Layer: общая функция форматирования адресов
+    const formatAddresses = (addresses) => {
+      if (!addresses || !Array.isArray(addresses)) return [];
+      return addresses.map(addr => {
+        const formatted = addressToSelector(__dompickMode, addr);
+        if (!formatted) {
+          __dlog('debug', 'Address Layer: не удалось отформатировать адрес:', addr);
+          return null;
+        }
+        return {
+          sel: formatted,
+          isCypress: __dompickMode === 'cypress',
+          isJs: __dompickMode === 'js',
+          score: addr.meta?.score,
+          __targetEl: __dompickCachedElement,
+          __address: addr
+        };
+      }).filter(Boolean); // Убираем null значения
+    };
+    
     // Если есть кэш для текущего режима, используем его
-    if (__dompickSelectorCache && __dompickCachedElement && __dompickSelectorCache[__dompickMode]) {
+    if (__dompickAddressPipeEnabled && __dompickAddressCache && __dompickCachedElement) {
+      // Address Layer: используем адресный кэш
+      clearNode(groupsContainer);
+      const availableActions = getAvailableActions(__dompickCachedElement);
+      const cachedAddresses = __dompickAddressCache;
+      
+      createSelectorGroup(groupsContainer, 'Базовые селекторы CSS', formatAddresses(cachedAddresses.basicSelectors || []), formatAddresses(cachedAddresses.moreBasic || []), availableActions, 'basic');
+      const containsTitle = (__dompickMode === 'js') ? 'Селекторы по тексту' : 'Селекторы с .contains';
+      createSelectorGroup(groupsContainer, containsTitle, formatAddresses(cachedAddresses.containsSelectors || []), formatAddresses(cachedAddresses.moreContains || []), availableActions, 'contains');
+      createSelectorGroup(groupsContainer, 'Позиционные селекторы', formatAddresses(cachedAddresses.nthSelectors || []), formatAddresses(cachedAddresses.moreNth || []), availableActions, 'nth');
+      createSelectorGroup(groupsContainer, 'XPath селекторы', formatAddresses(cachedAddresses.xpathSelectors || []), formatAddresses(cachedAddresses.moreXPath || []), availableActions, 'xpath');
+      if (cachedAddresses.aggressive && cachedAddresses.aggressive.length > 0) {
+        createSelectorGroup(groupsContainer, 'Агрессивные селекторы', formatAddresses(cachedAddresses.aggressive.slice(0, 5)), formatAddresses(cachedAddresses.aggressive.slice(5)), availableActions, 'aggressive');
+      }
+      return;
+    } else if (__dompickSelectorCache && __dompickCachedElement && __dompickSelectorCache[__dompickMode]) {
       // Очищаем содержимое
       clearNode(groupsContainer);
       const availableActions = getAvailableActions(__dompickCachedElement);
@@ -1338,6 +2342,55 @@ function makeDraggable(targetEl, handleEl, options = {}) {
       if (cachedGroups.aggressive && cachedGroups.aggressive.length > 0) {
         createSelectorGroup(groupsContainer, 'Агрессивные селекторы', cachedGroups.aggressive.slice(0, 5), cachedGroups.aggressive.slice(5), availableActions, 'aggressive');
       }
+      return;
+    } else if (__dompickSelectorCache && __dompickCachedElement) {
+      // Есть кэш, но не для текущего режима - генерируем для текущего режима
+      if (__dompickConfig.debug) {
+        __dlog('info', `🔄 Генерация селекторов для режима ${__dompickMode} (кэш есть, но не для текущего режима)`);
+      }
+      setTrustedHTML(groupsContainer, '<div id="__dompick-loading" style="opacity:.8;font-size:12px;color:var(--dompick-text-secondary)">Генерация селекторов для текущего режима...</div>');
+      
+      setTimeout(() => {
+        resetPerfGuards();
+        const __buildStart = performance.now();
+        __buildBudgetEnd = __buildStart + (__dompickConfig.buildBudgetMs || 5000);
+        
+        const groups = buildCandidates(__dompickCachedElement);
+        const __buildMs = performance.now() - __buildStart;
+        
+        // Сохраняем селекторы для текущего режима в кэш
+        __dompickSelectorCache[__dompickMode] = groups;
+        
+        // Отображаем селекторы
+        const loading = groupsContainer.querySelector('#__dompick-loading');
+        if (loading) loading.remove();
+        
+        const availableActions = getAvailableActions(__dompickCachedElement);
+        
+        // Address Layer: если включен address pipe, форматируем адреса перед отображением
+        if (__dompickAddressPipeEnabled) {
+          createSelectorGroup(groupsContainer, 'Базовые селекторы CSS', formatAddresses(groups.basicSelectors), formatAddresses(groups.moreBasic), availableActions, 'basic');
+          const containsTitle = (__dompickMode === 'js') ? 'Селекторы по тексту' : 'Селекторы с .contains';
+          createSelectorGroup(groupsContainer, containsTitle, formatAddresses(groups.containsSelectors), formatAddresses(groups.moreContains), availableActions, 'contains');
+          createSelectorGroup(groupsContainer, 'Позиционные селекторы', formatAddresses(groups.nthSelectors), formatAddresses(groups.moreNth), availableActions, 'nth');
+          createSelectorGroup(groupsContainer, 'XPath селекторы', formatAddresses(groups.xpathSelectors || []), formatAddresses(groups.moreXPath || []), availableActions, 'xpath');
+          if (groups.aggressive && groups.aggressive.length > 0) {
+            createSelectorGroup(groupsContainer, 'Агрессивные селекторы', formatAddresses(groups.aggressive.slice(0, 5)), formatAddresses(groups.aggressive.slice(5)), availableActions, 'aggressive');
+          }
+        } else {
+          // Обычный режим без Address Layer
+          createSelectorGroup(groupsContainer, 'Базовые селекторы CSS', groups.basicSelectors, groups.moreBasic, availableActions, 'basic');
+          const containsTitle = (__dompickMode === 'js') ? 'Селекторы по тексту' : 'Селекторы с .contains';
+          createSelectorGroup(groupsContainer, containsTitle, groups.containsSelectors, groups.moreContains, availableActions, 'contains');
+          createSelectorGroup(groupsContainer, 'Позиционные селекторы', groups.nthSelectors, groups.moreNth, availableActions, 'nth');
+          createSelectorGroup(groupsContainer, 'XPath селекторы', groups.xpathSelectors || [], groups.moreXPath || [], availableActions, 'xpath');
+          if (groups.aggressive && groups.aggressive.length > 0) {
+            createSelectorGroup(groupsContainer, 'Агрессивные селекторы', groups.aggressive.slice(0, 5), groups.aggressive.slice(5), availableActions, 'aggressive');
+          }
+        }
+        
+        resetPerfGuards();
+      }, 100);
       return;
     }
     
@@ -1364,25 +2417,42 @@ function makeDraggable(targetEl, handleEl, options = {}) {
       }
       
       // Инициализируем кэш если его нет
-      if (!__dompickSelectorCache) {
-        __dompickSelectorCache = {};
+      if (__dompickAddressPipeEnabled) {
+        // Address Layer: сохраняем адреса в кэш
+        __dompickAddressCache = groups;
+      } else {
+        if (!__dompickSelectorCache) {
+          __dompickSelectorCache = {};
+        }
+        // Сохраняем селекторы для текущего режима
+        __dompickSelectorCache[__dompickMode] = groups;
       }
-      
-      // Сохраняем селекторы для текущего режима
-      __dompickSelectorCache[__dompickMode] = groups;
 
       // Отображаем селекторы
       const loading = groupsContainer.querySelector('#__dompick-loading');
       if (loading) loading.remove();
       
       const availableActions = getAvailableActions(__dompickCachedElement);
-      createSelectorGroup(groupsContainer, 'Базовые селекторы CSS', groups.basicSelectors, groups.moreBasic, availableActions, 'basic');
-      const containsTitle = (__dompickMode === 'js') ? 'Селекторы по тексту' : 'Селекторы с .contains';
-      createSelectorGroup(groupsContainer, containsTitle, groups.containsSelectors, groups.moreContains, availableActions, 'contains');
-      createSelectorGroup(groupsContainer, 'Позиционные селекторы', groups.nthSelectors, groups.moreNth, availableActions, 'nth');
-      createSelectorGroup(groupsContainer, 'XPath селекторы', groups.xpathSelectors || [], groups.moreXPath || [], availableActions, 'xpath');
-      if (groups.aggressive && groups.aggressive.length > 0) {
-        createSelectorGroup(groupsContainer, 'Агрессивные селекторы', groups.aggressive.slice(0, 5), groups.aggressive.slice(5), availableActions, 'aggressive');
+      
+      // Address Layer: форматируем адреса если используем address pipe
+      if (__dompickAddressPipeEnabled) {
+        createSelectorGroup(groupsContainer, 'Базовые селекторы CSS', formatAddresses(groups.basicSelectors), formatAddresses(groups.moreBasic), availableActions, 'basic');
+        const containsTitle = (__dompickMode === 'js') ? 'Селекторы по тексту' : 'Селекторы с .contains';
+        createSelectorGroup(groupsContainer, containsTitle, formatAddresses(groups.containsSelectors), formatAddresses(groups.moreContains), availableActions, 'contains');
+        createSelectorGroup(groupsContainer, 'Позиционные селекторы', formatAddresses(groups.nthSelectors), formatAddresses(groups.moreNth), availableActions, 'nth');
+        createSelectorGroup(groupsContainer, 'XPath селекторы', formatAddresses(groups.xpathSelectors || []), formatAddresses(groups.moreXPath || []), availableActions, 'xpath');
+        if (groups.aggressive && groups.aggressive.length > 0) {
+          createSelectorGroup(groupsContainer, 'Агрессивные селекторы', formatAddresses(groups.aggressive.slice(0, 5)), formatAddresses(groups.aggressive.slice(5)), availableActions, 'aggressive');
+        }
+      } else {
+        createSelectorGroup(groupsContainer, 'Базовые селекторы CSS', groups.basicSelectors, groups.moreBasic, availableActions, 'basic');
+        const containsTitle = (__dompickMode === 'js') ? 'Селекторы по тексту' : 'Селекторы с .contains';
+        createSelectorGroup(groupsContainer, containsTitle, groups.containsSelectors, groups.moreContains, availableActions, 'contains');
+        createSelectorGroup(groupsContainer, 'Позиционные селекторы', groups.nthSelectors, groups.moreNth, availableActions, 'nth');
+        createSelectorGroup(groupsContainer, 'XPath селекторы', groups.xpathSelectors || [], groups.moreXPath || [], availableActions, 'xpath');
+        if (groups.aggressive && groups.aggressive.length > 0) {
+          createSelectorGroup(groupsContainer, 'Агрессивные селекторы', groups.aggressive.slice(0, 5), groups.aggressive.slice(5), availableActions, 'aggressive');
+        }
       }
       
       // ГАРАНТИЯ: если ни одного селектора не сгенерировалось — формируем абсолютный CSS‑путь
@@ -1399,7 +2469,7 @@ function makeDraggable(targetEl, handleEl, options = {}) {
   };
   
   // =========================================================================
-  // РАЗДЕЛ 3: ГЛАВНЫЕ ОБРАБОТЧИКИ СОБЫТИЙ
+  // РАЗДЕЛ 5: ГЛАВНЫЕ ОБРАБОТЧИКИ СОБЫТИЙ
   // =========================================================================
   
   // --- Управление режимом выбора (Selection Mode) ---
@@ -1564,37 +2634,92 @@ function makeDraggable(targetEl, handleEl, options = {}) {
   }
 
   // =========================================================================
-  // РАЗДЕЛ 4: ОСНОВНАЯ ЛОГИКА - ГЕНЕРАЦИЯ СЕЛЕКТОРОВ
+  // РАЗДЕЛ 6: ОСНОВНАЯ ЛОГИКА - ГЕНЕРАЦИЯ СЕЛЕКТОРОВ
   // =========================================================================
 
   // --- Функции-оркестраторы ---
   // Управляют процессом сбора, категоризации и сортировки селекторов.
   function buildCandidates(original) {
     const el = snapTarget(original);
-    // Собираем все возможные селекторы
-    const allSelectors = collectAllSelectors(el);
-    // Группируем селекторы по типам
-    const groups = categorizeSelectors(allSelectors);
-    return {
-      basicSelectors: groups.basic.slice(0, 3),      // Первые 3 без .contains и nth-child
-      containsSelectors: groups.contains.slice(0, 3), // 4,5,6 с .contains
-      nthSelectors: groups.nth.slice(0, 3),          // 7,8,9 с nth-child
-      xpathSelectors: (groups.xpath || []).slice(0, 3),          // 7,8,9 с nth-child
+    
+    if (__dompickAddressPipeEnabled) {
+      // Address Layer: собираем адреса вместо строк
+      const allAddresses = collectAllAddresses(el);
       
-      // Резервные селекторы для кнопок "ещё вариантов"
-     
-     moreBasic: groups.basic.slice(3),
-      moreContains: groups.contains.slice(3),
-      moreNth: groups.nth.slice(3),
-      moreXPath: (groups.xpath || []).slice(3),
+      // Address Layer: smoke-тест для адресов
+      const basicAddresses = allAddresses.filter(addr => addr.kind === 'css' && addr.path && addr.path[0] && !addr.path[0].includes('nth-child') && !addr.path[0].includes('nth-of-type'));
+      if (basicAddresses.length >= 1) {
+        const firstBasic = basicAddresses[0];
+        const uniqueness = isUniqueAddress(firstBasic, document);
+        if (uniqueness && uniqueness.unique) {
+          __dlog('info', `✅ SMOKE OK: найден ${basicAddresses.length} базовый адрес, первый уникален`);
+        } else {
+          __dlog('info', `⚠️ SMOKE WARN: найден ${basicAddresses.length} базовый адрес, но первый НЕ уникален`);
+        }
+      } else {
+        __dlog('info', `⚠️ SMOKE WARN: базовых адресов не найдено`);
+      }
       
-      // Дополнительные агрессивные селекторы
-      aggressive: groups.aggressive
-    };
+      // Группируем адреса по типам
+      const groups = categorizeAddresses(allAddresses);
+      return {
+        basicSelectors: groups.basic.slice(0, 3),
+        containsSelectors: groups.contains.slice(0, 3),
+        nthSelectors: groups.nth.slice(0, 3),
+        xpathSelectors: (groups.xpath || []).slice(0, 3),
+        moreBasic: groups.basic.slice(3),
+        moreContains: groups.contains.slice(3),
+        moreNth: groups.nth.slice(3),
+        moreXPath: (groups.xpath || []).slice(3),
+        aggressive: groups.aggressive
+      };
+    } else {
+      // Собираем все возможные селекторы
+      const allSelectors = collectAllSelectors(el);
+      
+      // Address Layer: smoke-тест
+      const basicSelectors = allSelectors.filter(s => !s.sel.includes('cy.contains') && !s.sel.includes('.contains(') && !s.sel.includes('nth-child') && !s.sel.includes('nth-of-type'));
+      if (basicSelectors.length >= 1) {
+        const firstBasic = basicSelectors[0];
+        const isUnique = document.querySelectorAll(firstBasic.sel).length === 1;
+        if (isUnique) {
+          __dlog('info', `✅ SMOKE OK: найден ${basicSelectors.length} базовый селектор, первый уникален`);
+        } else {
+          __dlog('info', `⚠️ SMOKE WARN: найден ${basicSelectors.length} базовый селектор, но первый НЕ уникален`);
+        }
+      } else {
+        __dlog('info', `⚠️ SMOKE WARN: базовых селекторов не найдено`);
+      }
+      
+      // Группируем селекторы по типам
+      const groups = categorizeSelectors(allSelectors);
+      return {
+        basicSelectors: groups.basic.slice(0, 3),      // Первые 3 без .contains и nth-child
+        containsSelectors: groups.contains.slice(0, 3), // 4,5,6 с .contains
+        nthSelectors: groups.nth.slice(0, 3),          // 7,8,9 с nth-child
+        xpathSelectors: (groups.xpath || []).slice(0, 3),          // 7,8,9 с nth-child
+        
+        // Резервные селекторы для кнопок "ещё вариантов"
+        moreBasic: groups.basic.slice(3),
+        moreContains: groups.contains.slice(3),
+        moreNth: groups.nth.slice(3),
+        moreXPath: (groups.xpath || []).slice(3),
+        
+        // Дополнительные агрессивные селекторы
+        aggressive: groups.aggressive
+      };
+    }
   }
 
   // Собирает все возможные селекторы, запуская различные стратегии.
   function collectAllSelectors(el) { // :contentReference{index=7}
+    // Address Layer: подробный лог ветки
+    if (__dompickAddressPipeEnabled) {
+      __dlog('info', `🔗 Address Pipe: ВКЛЮЧЕН (ветка addressPipe)`);
+    } else {
+      __dlog('info', `🔗 Address Pipe: ВЫКЛЮЧЕН (ветка legacy)`);
+    }
+    
     const allSelectors = [];
     const candidatesMap = new Map();
 
@@ -1603,7 +2728,18 @@ function makeDraggable(targetEl, handleEl, options = {}) {
       for (const item of batch) {
         if (budgetExpired()) break;
         if (!candidatesMap.has(item.sel)) {
-          if (item.isCypress) {
+          if (__dompickAddressPipeEnabled && item.__address) {
+            // Address Layer: проверяем уникальность адреса
+            const uniqueness = isUniqueAddress(item.__address, document);
+            if (uniqueness && uniqueness.unique) {
+              __dlog('debug', `Address Layer: адрес уникален (count: ${uniqueness.count})`);
+              item.__targetEl = el;
+              candidatesMap.set(item.sel, item);
+              allSelectors.push(item);
+            } else {
+              __dlog('debug', `Address Layer: адрес не уникален (count: ${uniqueness?.count || 0})`);
+            }
+          } else if (item.isCypress) {
             if (validateCypressSelector(item.sel, el)) {
               item.__targetEl = el;
               candidatesMap.set(item.sel, item);
@@ -1622,9 +2758,46 @@ function makeDraggable(targetEl, handleEl, options = {}) {
     // Сначала стратегии без цифр (score уже понижен внутри)
     addBatch(__timeit('byStableScopePath', () => byStableScopePath(el)));
     addBatch(__timeit('byClassCombos', () => byClassCombos(el)));
-    addBatch(__timeit('byAttr', () => byAttr(el)));
+    
+    // Address Layer: оборачиваем быстрые стратегии в Address
+    if (__dompickAddressPipeEnabled) {
+      const attrResults = __timeit('byAttr', () => byAttr(el));
+      const attrAddresses = attrResults.map(result => ({
+        kind: 'css',
+        path: [result.sel],
+        meta: { strategy: 'byAttr', score: result.score },
+        target: el
+      }));
+      addBatch(attrAddresses.map(addr => ({
+        sel: addressToSelector(__dompickMode, addr),
+        isCypress: __dompickMode === 'cypress',
+        isJs: __dompickMode === 'js',
+        score: addr.meta.score,
+        __targetEl: el,
+        __address: addr // Address Layer: сохраняем ссылку на адрес для проверки уникальности
+      })));
+      
+      const idResults = __timeit('byId', () => byId(el));
+      const idAddresses = idResults.map(result => ({
+        kind: 'css',
+        path: [result.sel],
+        meta: { strategy: 'byId', score: result.score },
+        target: el
+      }));
+      addBatch(idAddresses.map(addr => ({
+        sel: addressToSelector(__dompickMode, addr),
+        isCypress: __dompickMode === 'cypress',
+        isJs: __dompickMode === 'js',
+        score: addr.meta.score,
+        __targetEl: el,
+        __address: addr // Address Layer: сохраняем ссылку на адрес для проверки уникальности
+      })));
+    } else {
+      addBatch(__timeit('byAttr', () => byAttr(el)));
+      addBatch(__timeit('byId', () => byId(el)));
+    }
+    
     addBatch(__timeit('byPreferredData', () => byPreferredData(el)));
-    addBatch(__timeit('byId', () => byId(el)));
 
     // 2) Остальные базовые
     addBatch(__timeit('byAnyData', () => byAnyData(el)));
@@ -1639,11 +2812,21 @@ function makeDraggable(targetEl, handleEl, options = {}) {
     if (__dompickConfig.textSearchEnabled && !haveEnoughBasic) {
       const descendants = __countDescendants(el, __dompickConfig.maxDescendantsForTextSearch + 1);
       if (descendants <= __dompickConfig.maxDescendantsForTextSearch) {
-        if (__canRun('byCypressText', 2)) {
-          addBatch(__timeit('byCypressText', () => byCypressText(el)));
-        }
-        if (__canRun('byCypressCombo', 2)) {
-          addBatch(__timeit('byCypressCombo', () => byCypressCombo(el)));
+        if (__dompickAddressPipeEnabled) {
+          // Address Layer: используем byTextAddress вместо старых текстовых стратегий
+          if (__canRun('byTextAddress', 2)) {
+            const textAddresses = __timeit('byTextAddress', () => byTextAddress(el));
+            addBatch(textAddresses.map(addr => ({
+              sel: addressToSelector(__dompickMode, addr),
+              isCypress: __dompickMode === 'cypress',
+              isJs: __dompickMode === 'js',
+              score: addr.meta.score,
+              __targetEl: el,
+              __address: addr // Address Layer: сохраняем ссылку на адрес для проверки уникальности
+            })));
+          }
+        } else {
+          // Address Layer: старые текстовые стратегии удалены - заменены на byTextAddress
         }
       } else {
         __dlog('info', `📝 текстовые стратегии: пропуск (${descendants} потомков > ${__dompickConfig.maxDescendantsForTextSearch})`);
@@ -1671,20 +2854,75 @@ function makeDraggable(targetEl, handleEl, options = {}) {
     }
 
     // 4) Позиционные
-    if (!budgetExpired()) addBatch(__timeit('byNthChild', () => byNthChild(el)));
-    if (!budgetExpired()) addBatch(__timeit('byParentWithNth', () => byParentWithNth(el)));
-    if (!budgetExpired()) addBatch(__timeit('bySiblingSelectors', () => bySiblingSelectors(el)));
-    if (!budgetExpired()) addBatch(__timeit('byCalendarSelectors', () => byCalendarSelectors(el)));
+    if (__dompickAddressPipeEnabled) {
+      // Address Layer: используем адресные версии позиционных стратегий
+      if (!budgetExpired()) {
+        const nthAddresses = __timeit('byNthChildAddress', () => byNthChildAddress(el));
+        addBatch(nthAddresses.map(addr => ({
+          sel: addressToSelector(__dompickMode, addr),
+          isCypress: __dompickMode === 'cypress',
+          isJs: __dompickMode === 'js',
+          score: addr.meta.score,
+          __targetEl: el,
+          __address: addr
+        })));
+      }
+      if (!budgetExpired()) {
+        const parentNthAddresses = __timeit('byParentWithNthAddress', () => byParentWithNthAddress(el));
+        addBatch(parentNthAddresses.map(addr => ({
+          sel: addressToSelector(__dompickMode, addr),
+          isCypress: __dompickMode === 'cypress',
+          isJs: __dompickMode === 'js',
+          score: addr.meta.score,
+          __targetEl: el,
+          __address: addr
+        })));
+      }
+      if (!budgetExpired()) {
+        const calendarAddresses = __timeit('byCalendarSelectorsAddress', () => byCalendarSelectorsAddress(el));
+        addBatch(calendarAddresses.map(addr => ({
+          sel: addressToSelector(__dompickMode, addr),
+          isCypress: __dompickMode === 'cypress',
+          isJs: __dompickMode === 'js',
+          score: addr.meta.score,
+          __targetEl: el,
+          __address: addr
+        })));
+      }
+    } else {
+      // Address Layer: старые позиционные стратегии удалены - заменены на адресные версии
+    }
 
     // 5) Агрессивные — гейтим по размеру DOM и количеству базовых
     if (__dompickConfig.aggressiveEnabled && !haveEnoughBasic) {
       const totalDescendants = __countDescendants(document.body, __dompickConfig.domSizeSoftCap + 1);
       if (totalDescendants <= __dompickConfig.domSizeSoftCap) {
-        if (__canRun('generateAggressiveFallbacks', 3)) {
-          addBatch(__timeit('generateAggressiveFallbacks', () => generateAggressiveFallbacks(el)));
-        }
-        if (__canRun('generateSuperAggressiveFallbacks', 4)) {
-          addBatch(__timeit('generateSuperAggressiveFallbacks', () => generateSuperAggressiveFallbacks(el)));
+        if (__dompickAddressPipeEnabled) {
+          // Address Layer: используем адресные версии агрессивных стратегий
+          if (__canRun('generateAggressiveFallbacksAddress', 3)) {
+            const aggressiveAddresses = __timeit('generateAggressiveFallbacksAddress', () => generateAggressiveFallbacksAddress(el));
+            addBatch(aggressiveAddresses.map(addr => ({
+              sel: addressToSelector(__dompickMode, addr),
+              isCypress: __dompickMode === 'cypress',
+              isJs: __dompickMode === 'js',
+              score: addr.meta.score,
+              __targetEl: el,
+              __address: addr
+            })));
+          }
+          if (__canRun('generateSuperAggressiveFallbacksAddress', 4)) {
+            const superAggressiveAddresses = __timeit('generateSuperAggressiveFallbacksAddress', () => generateSuperAggressiveFallbacksAddress(el));
+            addBatch(superAggressiveAddresses.map(addr => ({
+              sel: addressToSelector(__dompickMode, addr),
+              isCypress: __dompickMode === 'cypress',
+              isJs: __dompickMode === 'js',
+              score: addr.meta.score,
+              __targetEl: el,
+              __address: addr
+            })));
+          }
+        } else {
+          // Address Layer: старые агрессивные стратегии удалены - заменены на адресные версии
         }
       } else {
         __dlog('info', `🔥 агрессивные стратегии: пропуск (DOM слишком большой: ${totalDescendants} > ${__dompickConfig.domSizeSoftCap})`);
@@ -1812,7 +3050,7 @@ function makeDraggable(targetEl, handleEl, options = {}) {
   };
   
   // =========================================================================
-  // РАЗДЕЛ 5: СТРАТЕГИИ ГЕНЕРАЦИИ СЕЛЕКТОРОВ
+  // РАЗДЕЛ 7: СТРАТЕГИИ ГЕНЕРАЦИИ СЕЛЕКТОРОВ
   // =========================================================================
 
   // --- 5.1: Базовые CSS селекторы ---
@@ -1900,182 +3138,7 @@ function makeDraggable(targetEl, handleEl, options = {}) {
     for(const {name,value} of similarAttrs){ const s=`[${name}="${esc(value)}"]`; if(isUnique(s,el)) out.push({sel:s}); const s2=`${el.tagName.toLowerCase()}[${name}="${esc(value)}"]`; if(isUnique(s2,el)) out.push({sel:s2}); } return out;
   }
 
-  // --- 5.2: Селекторы по тексту (Cypress & JS) ---
-  function byCypressText(el) {
-    const out = [];
-    const texts = getAllTexts(el);
-    const tag = el.tagName.toLowerCase();
-    
-    // Обрабатываем все найденные тексты
-    for (const text of texts) {
-      if (!isGoodTextForContains(text)) continue;
-      const escapedText = text.replace(/'/g, "\\'");
-      
-      if (__dompickMode === 'js') {
-        // Глобально уникальный текст
-        if (isUniqueByText(el, text)) {
-          out.push({ sel: buildJsFindInScope(null, '*', text, false), isJs: true });
-        }
-        // Уникален среди тега
-        if (isUniqueByText(el, text, tag)) {
-          out.push({ sel: buildJsFindInScope(null, tag, text, false), isJs: true });
-        }
-        // Специальные контейнеры (видимый)
-        const specialContainer = el.closest('.datepicker, .modal, .modal-body, .modal-content, .modal-dialog, .dropdown, .popup, .overlay, .sidebar, .panel');
-        if (specialContainer) {
-          const containerClass = specialContainer.classList[0];
-          if (containerClass && isUniqueByTextInParent(el, text, specialContainer)) {
-            out.push({ sel: buildJsFindInScope(`.${containerClass}`, '*', text, true), isJs: true });
-          }
-        }
-        // Уникальный контекст
-        if (!isUniqueByText(el, text)) {
-          const uniqueContext = findMinimalUniqueContext(el, text);
-          if (uniqueContext) {
-            out.push({ sel: buildJsFindInScope(uniqueContext, '*', text, false), isJs: true });
-          }
-        }
-      } else {
-        // Режим Cypress
-        if (isUniqueByText(el, text)) {
-          const containsCmd = `cy.contains('${escapedText}')`;
-          out.push({sel: containsCmd, isCypress: true});
-        }
-        if (isUniqueByText(el, text, tag)) {
-          const containsWithTagCmd = `cy.contains('${tag}', '${escapedText}')`;
-          out.push({sel: containsWithTagCmd, isCypress: true});
-        }
-        const specialContainer = el.closest('.datepicker, .modal, .modal-body, .modal-content, .modal-dialog, .dropdown, .popup, .overlay, .sidebar, .panel');
-        if (specialContainer) {
-          const containerClass = specialContainer.classList[0];
-          if (containerClass && isUniqueByTextInParent(el, text, specialContainer)) {
-            const visibleContainsCmd = `cy.get('.${containerClass}').filter(':visible').contains('${escapedText}')`;
-            out.push({sel: visibleContainsCmd, isCypress: true});
-          }
-        }
-        if (!isUniqueByText(el, text)) {
-          const uniqueContext = findMinimalUniqueContext(el, text);
-          if (uniqueContext) {
-            const contextContainsCmd = `cy.get('${uniqueContext}').contains('${escapedText}')`;
-            out.push({sel: contextContainsCmd, isCypress: true});
-          }
-        }
-      }
-    }
-    
-    return out;
-  }
-  
-  // Генерация комбинированных Cypress команд (селектор + текст)
-  function byCypressCombo(el) {
-    const out = [];
-    const texts = getAllTexts(el);
-    
-    // Обрабатываем все найденные тексты
-    for (const text of texts) {
-      if (!isGoodTextForContains(text)) continue;
-      const escapedText = text.replace(/'/g, "\\'");
-      
-      // ПРИНЦИП: ВСЕГДА используем уникальный контекст для cy.get().contains()
-      // Ищем уникальные предки для комбинации get().contains()
-      let p = el.parentElement, depth = 0;
-      while (p && depth < 4) { // Увеличиваем глубину поиска
-        // Проверяем ID предка (высший приоритет)
-        if (p.id) {
-          const parentSel = `#${esc(p.id)}`;
-          if (document.querySelectorAll(parentSel).length === 1) {
-            if (isUniqueByTextInParent(el, text, p)) {
-              if (__dompickMode === 'js') {
-                out.push({ sel: buildJsFindInScope(parentSel, '*', text, false), isJs: true });
-              } else {
-                const cmd = `cy.get('${parentSel}').contains('${escapedText}')`;
-                out.push({sel: cmd, isCypress: true});
-              }
-            }
-          }
-        }
-        
-        // Проверяем предпочтительные data-атрибуты предка
-        for (const attr of prefDataAttrs) {
-          const value = p.getAttribute(attr);
-          if (value) {
-            const parentSel = `[${attr}="${esc(value)}"]`;
-            if (document.querySelectorAll(parentSel).length === 1) {
-              if (isUniqueByTextInParent(el, text, p)) {
-                if (__dompickMode === 'js') {
-                  out.push({ sel: buildJsFindInScope(parentSel, '*', text, false), isJs: true });
-                } else {
-                  const cmd = `cy.get('${parentSel}').contains('${escapedText}')`;
-                  out.push({sel: cmd, isCypress: true});
-                }
-              }
-            }
-          }
-        }
-        
-        // Проверяем уникальные классы предка
-        if (p.classList && p.classList.length > 0) {
-          const stableClasses = [...p.classList].filter(c => 
-           c && 
-            !looksDynamic(c) && 
-            !c.startsWith('__dompick') &&
-            c.length > 2
-          );
-// Одиночные классы
-          for (const cls of stableClasses.slice(0, 2)) {
-            const parentSel = `.${esc(cls)}`;
-            if (document.querySelectorAll(parentSel).length === 1) {
-              if (isUniqueByTextInParent(el, text, p)) {
-                if (__dompickMode === 'js') {
-                  out.push({ sel: buildJsFindInScope(parentSel, '*', text, false), isJs: true });
-                } else {
-                  const cmd = `cy.get('${parentSel}').contains('${escapedText}')`;
-                  out.push({sel: cmd, isCypress: true});
-                }
-              }
-            }
-          }
-          
-          // Комбинации классов
-          if (stableClasses.length >= 2) {
-            const parentSel = `.${esc(stableClasses[0])}.${esc(stableClasses[1])}`;
-            if (document.querySelectorAll(parentSel).length === 1) {
-              if (isUniqueByTextInParent(el, text, p)) {
-                if (__dompickMode === 'js') {
-                  out.push({ sel: buildJsFindInScope(parentSel, '*', text, false), isJs: true });
-                } else {
-                  const cmd = `cy.get('${parentSel}').contains('${escapedText}')`;
-                  out.push({sel: cmd, isCypress: true});
-                }
-              }
-            }
-          }
-        }
-        
-        // Семантические контейнеры как контекст
-        const semanticContainers = ['header', 'nav', 'main', 'section', 'article', 'aside', 'footer', 'form'];
-        const parentTag = p.tagName.toLowerCase();
-        if (semanticContainers.includes(parentTag)) {
-          if (isUniqueByTextInParent(el, text, p)) {
-            const sameTagContainers = document.querySelectorAll(parentTag);
-            if (sameTagContainers.length <= 2) { // Только если семантический тег почти уникален
-              if (__dompickMode === 'js') {
-                out.push({ sel: buildJsFindInScope(parentTag, '*', text, false), isJs: true });
-              } else {
-                const cmd = `cy.get('${parentTag}').contains('${escapedText}')`;
-                out.push({sel: cmd, isCypress: true});
-              }
-            }
-          }
-        }
-        
-        p = p.parentElement;
-        depth++;
-      }
-    }
-    
-    return out;
-  }
+  // Address Layer: byCypressText и byCypressCombo удалены - заменены на byTextAddress
   
   // --- 5.3: Контекстные и иерархические селекторы ---
   function uniqueWithinScope(el) {
@@ -2230,96 +3293,7 @@ function makeDraggable(targetEl, handleEl, options = {}) {
     return isUnique(sel,el)?[{sel,score: usedStableId ? 62 : 58}]:[];
   }
   
-  // Структурные селекторы с nth-child
-  function byNthChild(el) {
-    const out = [];
-    const parent = el.parentElement;
-    if (!parent) return out;
-    
-    const tag = el.tagName.toLowerCase();
-    const siblings = [...parent.children];
-    const index = siblings.indexOf(el) + 1;
-    
-    // nth-child по позиции среди всех детей
-    const nthChildSel = `${tag}:nth-child(${index})`;
-    if (isUnique(nthChildSel, el)) {
-      out.push({sel: nthChildSel});
-    }
-    
-    // nth-of-type по позиции среди элементов того же типа
-    const sameTypeSiblings = siblings.filter(s => s.tagName === el.tagName);
-    if (sameTypeSiblings.length > 1) {
-      const typeIndex = sameTypeSiblings.indexOf(el) + 1;
-      const nthOfTypeSel = `${tag}:nth-of-type(${typeIndex})`;
-      if (isUnique(nthOfTypeSel, el)) {
-        out.push({sel: nthOfTypeSel});
-      }
-    }
-    
-    // first-child, last-child
-    if (index === 1) {
-      const firstChildSel = `${tag}:first-child`;
-      if (isUnique(firstChildSel, el)) {
-        out.push({sel: firstChildSel});
-      }
-    }
-    
-    if (index === siblings.length) {
-      const lastChildSel = `${tag}:last-child`;
-      if (isUnique(lastChildSel, el)) {
-        out.push({sel: lastChildSel});
-      }
-    }
-    
-    return out;
-  }
-  
-  // Селекторы по родительским элементам с nth-child
-  function byParentWithNth(el) {
-    const out = [];
-    const parent = el.parentElement;
-    if (!parent) return out;
-    
-    const tag = el.tagName.toLowerCase();
-    const siblings = [...parent.children];
-    const index = siblings.indexOf(el) + 1;
-    
-    // Поиск родителей с ID или классами
-    let currentParent = parent;
-    let depth = 0;
-    
-    while (currentParent && depth < 3) {
-      // Родитель с ID
-      if (currentParent.id) {
-        const parentSel = `#${esc(currentParent.id)}`;
-        const childSel = `${parentSel} > ${tag}:nth-child(${index})`;
-        if (isUnique(childSel, el)) {
-          out.push({sel: childSel});
-        }
-      }
-      
-      // Родитель с классами
-      if (currentParent.classList && currentParent.classList.length > 0) {
-        const classes = [...currentParent.classList].filter(c => 
-          c && 
-          !looksDynamic(c) && 
-          !c.startsWith('__dompick') // Исключаем служебные классы
-        ).slice(0, 2);
-        if (classes.length > 0) {
-          const parentSel = `.${classes.map(c => esc(c)).join('.')}`;
-          const childSel = `${parentSel} > ${tag}:nth-child(${index})`;
-          if (isUnique(childSel, el)) {
-            out.push({sel: childSel});
-          }
-        }
-      }
-      
-      currentParent = currentParent.parentElement;
-      depth++;
-    }
-    
-    return out;
-  }
+  // Address Layer: старые позиционные функции byNthChild и byParentWithNth удалены - заменены на адресные версии
   
   // --- 5.5: XPath селекторы ---
 function __xpathLiteral(value) {
@@ -2566,251 +3540,43 @@ function byXPath(el) {
   }
   
   // --- 5.6: Агрессивные и Fallback стратегии ---
-  // Комбинированные селекторы с соседними элементами
-  function bySiblingSelectors(el) {
-    const out = [];
-    const parent = el.parentElement;
-    if (!parent) return out;
-    
-    const tag = el.tagName.toLowerCase();
-    const siblings = [...parent.children];
-    const index = siblings.indexOf(el);
-
-    // Селектор через предыдущий соседний элемент
-    if (index > 0) {
-      const prevSibling = siblings[index - 1];
-      if (prevSibling.id) {
-        const siblingId = `#${esc(prevSibling.id)}`;
-        const adjacentSel = `${siblingId} + ${tag}`;
-        if (isUnique(adjacentSel, el)) {
-          out.push({sel: adjacentSel});
-        }
-      }
-      
-      if (prevSibling.classList && prevSibling.classList.length > 0) {
-        const classes = [...prevSibling.classList].filter(c => 
-          c && 
-          !looksDynamic(c) && 
-          !c.startsWith('__dompick') // Исключаем служебные классы
-        ).slice(0, 1);
-        if (classes.length > 0) {
-          const siblingClass = `.${esc(classes[0])}`;
-          const adjacentSel = `${siblingClass} + ${tag}`;
-          if (isUnique(adjacentSel, el)) {
-            out.push({sel: adjacentSel});
-          }
-        }
-      }
-    }
-    
-    return out;
-  }
+  // Address Layer: старые функции bySiblingSelectors и byCalendarSelectors удалены - заменены на адресные версии
   
-  // Специальные селекторы для календарей и подобных компонентов
-  function byCalendarSelectors(el) {
-    const out = [];
-    const tag = el.tagName.toLowerCase();
-    const text = el.textContent?.trim();
-    
-    // СТРОГАЯ проверка, что это именно элемент календаря
-    const datepickerContainer = el.closest('.datepicker');
-    const calendarContainer = el.closest('[class*="calendar"]');
-    const dateContainer = el.closest('[class*="date"]');
-    
-    // Проверяем только если элемент ДЕЙСТВИТЕЛЬНО в календаре
-    if (!datepickerContainer && !calendarContainer && !dateContainer) {
-      return out;
-    }
-    
-    // Дополнительная проверка для td - должен быть в календарной таблице
-    if (tag === 'td') {
-      const table = el.closest('table');
-      if (!table) return out;
-      
-      // Проверяем, что таблица содержит календарные элементы
-      const hasCalendarClasses = table.querySelector('.day, .today, .active, .month, .year');
-      if (!hasCalendarClasses) return out;
-    }
-    
-    // Селекторы только для datepicker календарей
-    if (datepickerContainer && tag === 'td' && text && /^\d+$/.test(text)) {
-      const dayNumber = text;
-      // Проверяем, что .datepicker действительно существует в документе
-      if (document.querySelector('.datepicker')) {
-        // Поиск по тексту в видимом календаре - с проверкой
-        const visibleCalendarSel = `cy.get('.datepicker').filter(':visible').contains('${dayNumber}')`;
+  // Address Layer: старая функция generateAggressiveFallbacks удалена - заменена на адресную версию
 
-        // Проверяем, что этот селектор действительно найдет наш элемент
-        const testElements = document.querySelectorAll('.datepicker');
-        let foundInDatepicker = false;
-        for (const dp of testElements) {
-          if (dp.contains(el)) {
-            foundInDatepicker = true;
-            break;
-          }
-        }
-        
-        if (foundInDatepicker) {
-          out.push({sel: visibleCalendarSel, isCypress: true});
-          // Поиск в datepicker-days только если такой элемент существует
-          if (document.querySelector('.datepicker-days')) {
-            const activeDaysSel = `cy.get('.datepicker-days:visible td').contains('${dayNumber}')`;
-            out.push({sel: activeDaysSel, isCypress: true});
-          }
-        }
+  // Абсолютный CSS-путь к элементу: html > body > ... > tag:nth-of-type(n)
+  function buildAbsoluteCssPath(el) {
+    try {
+      const parts = [];
+      let current = el;
+      const stopAt = document.documentElement; // html
+      while (current && current !== stopAt) {
+        const parent = current.parentElement;
+        if (!parent) break;
+        const tag = current.tagName.toLowerCase();
+        const sameTagSiblings = [...parent.children].filter(c => c.tagName.toLowerCase() === tag);
+        const index = sameTagSiblings.indexOf(current);
+        // Если среди детей родителя этот tag встречается один раз, nth-of-type не нужен
+        const part = sameTagSiblings.length === 1 || index < 0 ? tag : `${tag}:nth-of-type(${index + 1})`;
+        parts.unshift(part);
+        current = parent;
       }
-      
-      // Селекторы относительно today элемента - только если today существует
-      const todayElement = datepickerContainer.querySelector('td.today');
-      if (todayElement) {
-        const allDays = [...datepickerContainer.querySelectorAll('td.day, td.today, td.active')];
-        const todayIndex = allDays.indexOf(todayElement);
-        const currentIndex = allDays.indexOf(el);
-        
-        if (todayIndex >= 0 && currentIndex >= 0) {
-          const diff = currentIndex - todayIndex;
-          if (diff !== 0) {
-            const relativeSel = diff > 0 
-              ? `cy.get('.datepicker').filter(':visible').find('td.today').nextAll('td').eq(${diff - 1})`
-              : `cy.get('.datepicker').filter(':visible').find('td.today').prevAll('td').eq(${Math.abs(diff) - 1})`;
-            out.push({sel: relativeSel, isCypress: true});
-          }
-        }
-      }
+      return parts.length ? parts.join(' > ') : el.tagName.toLowerCase();
+    } catch {
+      return el.tagName ? el.tagName.toLowerCase() : '*';
     }
-    
-    return out;
-  }
-  
-  // Агрессивные fallback селекторы для крайних случаев
-  function generateAggressiveFallbacks(el) {
-    const out = [];
-    const tag = el.tagName.toLowerCase();
-    
-    // 1. Селекторы с уникальными родителями + nth-child
-    const parentWithNthSelectors = generateParentNthSelectors(el);
-    out.push(...parentWithNthSelectors);
-
-    // 2. Селекторы по позиции в документе (только если уникальные)
-    const allSameTagElements = document.querySelectorAll(tag);
-    const elementIndex = [...allSameTagElements].indexOf(el);
-    if (elementIndex >= 0) {
-      const nthSel = `${tag}:nth-of-type(${elementIndex + 1})`;
-      if (isUnique(nthSel, el)) {
-        out.push({sel: nthSel});
-      }
-    }
-    
-    // 3. Селектор по тексту для JS-режима: выбираем ближайший визуально подходящий узел
-    const textContent = el.textContent?.trim();
-    if (textContent && textContent.length > 0 && textContent.length < 50) {
-      const sample = textContent.length > 25 ? textContent.substring(0, 25) : textContent;
-      if (__dompickMode === 'js') {
-        const jsExpr = buildJsFindInScope(null, '*', sample, false);
-        out.push({ sel: jsExpr, __targetEl: el });
-      } else {
-        const partialText = sample;
-        if (partialText.length > 2) {
-          const uniqueContext = findMinimalUniqueContext(el, partialText);
-          if (uniqueContext) {
-            const contextContainsSel = `cy.get('${uniqueContext}').contains('${partialText.replace(/'/g, "\\'")}')`;
-            out.push({sel: contextContainsSel, isCypress: true});
-          } else if (isUniqueByText(el, partialText)) {
-            const containsSel = `cy.contains('${partialText.replace(/'/g, "\\'")}')`;
-            out.push({sel: containsSel, isCypress: true});
-          }
-        }
-      }
-    }
-    
-    // 4. Селекторы по атрибутам (только уникальные)
-    if (el.attributes) {
-      for (const {name, value} of el.attributes) {
-        if (name && value && value.length < 50 && !looksDynamic(value)) {
-          // Фильтруем системные классы DOM Picker'а
-          if (name === 'class' && value.includes('__dompick')) continue;
-          
-          const attrSel = `[${name}="${esc(value)}"]`;
-          if (isUnique(attrSel, el)) {
-            out.push({sel: attrSel});
-          }
-          
-          const tagAttrSel = `${tag}[${name}="${esc(value)}"]`;
-          if (isUnique(tagAttrSel, el)) {
-            out.push({sel: tagAttrSel});
-          }
-        }
-      }
-    }
-    
-    // 5. Селекторы по классам (только стабильные и уникальные)
-    if (el.classList && el.classList.length > 0) {
-      const stableClasses = [...el.classList].filter(c => 
-        c && 
-        !looksDynamic(c) && 
-        !c.startsWith('__dompick') && // Исключаем наши служебные классы
-        c.length > 1
-      );
-      
-      for (const cls of stableClasses.slice(0, 3)) {
-        const classSel = `.${esc(cls)}`;
-        if (isUnique(classSel, el)) {
-          out.push({sel: classSel});
-        }
-        
-        const tagClassSel = `${tag}.${esc(cls)}`;
-        if (isUnique(tagClassSel, el)) {
-          out.push({sel: tagClassSel});
-        }
-      }
-    }
-    
-    // 6. Простой селектор по тегу только если он уникален
-    if (isUnique(tag, el)) {
-      out.push({sel: tag});
-    }
-    
-    // 7. Минимальный уникальный позиционный селектор (короткий суффикс абсолютного пути)
-    const minimalPositional = buildMinimalPositionalSelector(el);
-    if (minimalPositional) {
-      out.push({ sel: minimalPositional });
-    }
-    
-    // 8. Абсолютный CSS-путь (как самый низкоприоритетный запасной вариант)
-    out.push({ sel: buildAbsoluteCssPath(el) });
-    return out;
   }
 
-  // Супер-агрессивные fallback селекторы для экстремальных случаев
-  function generateSuperAggressiveFallbacks(el) {
-    const out = [];
-    const tag = el.tagName.toLowerCase();
-    
-    // 1. Глубокие nth-child цепочки
-    const deepNthSelectors = generateDeepNthSelectors(el);
-    out.push(...deepNthSelectors);
+  // Address Layer: функция buildAbsoluteCssSegments удалена - заменена на адресную версию
 
-    // 2. Селекторы через соседние элементы
-    const siblingSelectors = generateAdvancedSiblingSelectors(el);
-    out.push(...siblingSelectors);
+  // Address Layer: функция buildMinimalPositionalSelector удалена - заменена на адресную версию
 
-    // 3. Комбинированные селекторы с частичными атрибутами
-    const partialAttrSelectors = generatePartialAttributeSelectors(el);
-    out.push(...partialAttrSelectors);
+  // Address Layer: старые вспомогательные функции удалены - заменены на адресные версии
 
-    // 4. Селекторы по псевдо-классам
-    const pseudoSelectors = generatePseudoClassSelectors(el);
-    out.push(...pseudoSelectors);
-
-    // 5. Относительные Cypress селекторы
-    const relativeCypressSelectors = generateRelativeCypressSelectors(el);
-    out.push(...relativeCypressSelectors);
-    
-    return out;
-  }
+  // Address Layer: старая функция generateSuperAggressiveFallbacks удалена - заменена на адресную версию
   
   // =========================================================================
-  // РАЗДЕЛ 6: АНАЛИЗ И ОЦЕНКА СЕЛЕКТОРОВ (СКОРИНГ)
+  // РАЗДЕЛ 8: АНАЛИЗ И ОЦЕНКА СЕЛЕКТОРОВ (СКОРИНГ)
   // =========================================================================
   
   // --- Конфигурация весов для оценки селекторов ---
@@ -3223,239 +3989,10 @@ function byXPath(el) {
   }
 
   // --- Валидаторы селекторов ---
-  // Валидация Cypress селектора - проверяет, что селектор действительно найдет нужный элемент
-  const validateCypressSelector = (selector, targetElement) => {
-    try {
-      // Для относительных cy.contains селекторов (с .find, .children, .next и т.д.)
-      if (selector.includes('cy.contains(') && (selector.includes('.find(') || selector.includes('.children(') || 
-          selector.includes('.next(') || selector.includes('.prev(') || selector.includes('.parent('))) {
-        return validateRelativeCypressSelector(selector, targetElement);
-      }
-      
-      // Для cy.contains селекторов с контейнером
-      if (selector.includes('.contains(')) {
-        const text = selector.match(/contains\(['"]([^'"]+)['"]\)/)?.[1];
-        if (!text) return false;
-        
-        const elementText = getElementText(targetElement);
-        if (elementText !== text) return false;
-        
-        // СТРОГАЯ проверка: если есть контейнер, элемент ДОЛЖЕН быть уникальным в нём
-        const containerMatch = selector.match(/cy\.get\(['"]([^'"]+)['"]\)/);
-        if (containerMatch) {
-          const containerSelector = containerMatch[1];
-          try {
-            const containers = document.querySelectorAll(containerSelector);
-            if (containers.length === 0) return false; // Контейнер не найден
-            
-            let foundInContainer = false;
-            let isUniqueInContainer = true;
-            
-            for (const container of containers) {
-              if (container.contains(targetElement)) {
-                foundInContainer = true;
-                // КРИТИЧНО: проверяем уникальность текста в этом контейнере
-                if (!isUniqueByTextInParent(targetElement, text, container)) {
-                  isUniqueInContainer = false;
-                  break;
-                }
-              }
-            }
-            
-            return foundInContainer && isUniqueInContainer;
-          } catch {
-            return false;
-          }
-        } else {
-          // Простой cy.contains('text') - проверяем глобальную уникальность
-          return isUniqueByText(targetElement, text);
-        }
-      }
-      
-      // Для cy.contains('tag', 'text') селекторов
-      if (selector.includes('cy.contains(')) {
-        const tagTextMatch = selector.match(/cy\.contains\(['"]([^'"]+)['"],\s*['"]([^'"]+)['"]\)/);
-        if (tagTextMatch) {
-          const [, tag, text] = tagTextMatch;
-          const elementText = getElementText(targetElement);
-          const elementTag = targetElement.tagName.toLowerCase();
-          
-          return elementText === text && 
-                 elementTag === tag && 
-                 isUniqueByText(targetElement, text, tag);
-        }
-        
-        // Простой cy.contains('text')
-        const textMatch = selector.match(/cy\.contains\(['"]([^'"]+)['"]\)/);
-        if (textMatch) {
-          const text = textMatch[1];
-          const elementText = getElementText(targetElement);
-          return elementText === text && isUniqueByText(targetElement, text);
-        }
-      }
-      
-      return true; // Для других типов селекторов пока пропускаем детальную проверку
-    } catch {
-      return false;
-    }
-  };
-
-  // Валидация относительных Cypress селекторов
-  const validateRelativeCypressSelector = (selector, targetElement) => {
-    try {
-      // Извлекаем базовый текст и метод
-      const baseTextMatch = selector.match(/cy\.contains\(['"]([^'"]+)['"]\)/);
-      if (!baseTextMatch) return false;
-      
-      const baseText = baseTextMatch[1];
-      
-      // Находим базовый элемент с этим текстом
-      const baseElements = [];
-      const allElements = document.querySelectorAll('*');
-      for (const el of allElements) {
-        const elText = getElementText(el);
-        if (elText === baseText) {
-          baseElements.push(el);
-        }
-      }
-      
-      if (baseElements.length === 0) return false; // Базовый элемент не найден
-      if (baseElements.length > 1) return false;   // Базовый текст не уникален
-      
-      const baseElement = baseElements[0];
-      
-      // Определяем метод и проверяем результат
-      if (selector.includes('.children()')) {
-        // Простой children()
-        if (selector.match(/\.children\(\)$/)) {
-          const children = [...baseElement.children];
-          return children.length === 1 && children[0] === targetElement;
-        }
-        
-        // children('tag')
-        const childrenTagMatch = selector.match(/\.children\(['"]([^'"]+)['"]\)/);
-        if (childrenTagMatch) {
-          const tag = childrenTagMatch[1];
-          const tagChildren = [...baseElement.children].filter(child => 
-            child.tagName.toLowerCase() === tag
-          );
-          return tagChildren.length === 1 && tagChildren[0] === targetElement;
-        }
-        
-        // children().eq(index)
-        const childrenEqMatch = selector.match(/\.children\(\)\.eq\((\d+)\)/);
-        if (childrenEqMatch) {
-          const index = parseInt(childrenEqMatch[1]);
-          const children = [...baseElement.children];
-          return children[index] === targetElement;
-        }
-      }
-      
-      if (selector.includes('.find(')) {
-        // find("*")
-        if (selector.includes('.find("*")')) {
-          const descendants = baseElement.querySelectorAll('*');
-          return descendants.length === 1 && descendants[0] === targetElement;
-        }
-        
-        // find('tag')
-        const findTagMatch = selector.match(/\.find\(['"]([^'"]+)['"]\)/);
-        if (findTagMatch) {
-          const tag = findTagMatch[1];
-          const tagDescendants = baseElement.querySelectorAll(tag);
-          return tagDescendants.length === 1 && tagDescendants[0] === targetElement;
-        }
-      }
-       
-      if (selector.includes('.next()')) {
-        const nextElement = baseElement.nextElementSibling;
-        return nextElement === targetElement;
-      }
-      
-      if (selector.includes('.prev()')) {
-        const prevElement = baseElement.previousElementSibling;
-        return prevElement === targetElement;
-      }
-      
-      if (selector.includes('.nextAll()')) {
-         // Простой nextAll()
-        if (selector.match(/\.nextAll\(\)$/)) {
-          const nextElements = [];
-          let current = baseElement.nextElementSibling;
-          while (current) {
-            nextElements.push(current);
-            current = current.nextElementSibling;
-          }
-          return nextElements.length === 1 && nextElements[0] === targetElement;
-        }
-        
-        // nextAll().eq(index)
-        const nextAllEqMatch = selector.match(/\.nextAll\(\)\.eq\((\d+)\)/);
-        if (nextAllEqMatch) {
-          const index = parseInt(nextAllEqMatch[1]);
-          const nextElements = [];
-          let current = baseElement.nextElementSibling;
-          while (current) {
-            nextElements.push(current);
-            current = current.nextElementSibling;
-          }
-          return nextElements[index] === targetElement;
-        }
-      }
-      
-      if (selector.includes('.prevAll()')) {
-        // Простой prevAll()
-        if (selector.match(/\.prevAll\(\)$/)) {
-          const prevElements = [];
-          let current = baseElement.previousElementSibling;
-          while (current) {
-            prevElements.unshift(current);
-            current = current.previousElementSibling;
-          }
-          return prevElements.length === 1 && prevElements[0] === targetElement;
-        }
-        
-        // prevAll().eq(index)
-        const prevAllEqMatch = selector.match(/\.prevAll\(\)\.eq\((\d+)\)/);
-        if (prevAllEqMatch) {
-          const index = parseInt(prevAllEqMatch[1]);
-          const prevElements = [];
-          let current = baseElement.previousElementSibling;
-          while (current) {
-            prevElements.unshift(current);
-            current = current.previousElementSibling;
-          }
-          return prevElements[index] === targetElement;
-        }
-      }
-      
-      if (selector.includes('.parent()')) {
-        return baseElement.parentElement === targetElement;
-      }
-      
-      if (selector.includes('.parents(')) {
-        const parentsTagMatch = selector.match(/\.parents\(['"]([^'"]+)['"]\)/);
-        if (parentsTagMatch) {
-          const tag = parentsTagMatch[1];
-          let current = baseElement.parentElement;
-          while (current) {
-            if (current.tagName.toLowerCase() === tag && current === targetElement) {
-               return true;
-            }
-            current = current.parentElement;
-          }
-          return false;
-        }
-      }
-      
-      return false;
-    } catch {
-      return false;
-    }
-  };
+  // Address Layer: validateCypressSelector и validateRelativeCypressSelector удалены - заменены на isUniqueAddress
 
   // =========================================================================
-  // РАЗДЕЛ 7: ВСПОМОГАТЕЛЬНЫЕ УТИЛИТЫ
+  // РАЗДЕЛ 9: ВСПОМОГАТЕЛЬНЫЕ УТИЛИТЫ
   // =========================================================================
 
   // --- 7.1: Утилиты для производительности ---
@@ -3658,159 +4195,10 @@ function byXPath(el) {
     return similarAttrs;
   };
   
-  // --- 7.4: Конвертеры селекторов (Cypress <-> JS) ---
-  function __escapeJsString(s){
-    try { return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'"); } catch { return s; }
-  }
-
-  function convertJsToCypressBase(jsExpr) {
-    if (!jsExpr || typeof jsExpr !== 'string') return 'cy.get("body")';
-    let expr = jsExpr.trim().replace(/;\s*$/, '');
-    
-    // Проверяем, является ли это уже Cypress селектором
-    if (expr.includes('cy.get(') || expr.includes('cy.contains(')) {
-      // Это уже Cypress селектор, возвращаем как есть
-      return expr;
-    }
-    
-    // document.querySelector('sel')
-    let m = expr.match(/^document\.querySelector\((['"])(.+?)\1\)$/);
-    if (m) {
-      const sel = m[2];
-      return `cy.get('${sel}')`;
-    }
-    
-    // Array.from(document.querySelectorAll('*')).find(el => el.textContent.includes('text'))
-     m = expr.match(/Array\.from\(document\.querySelectorAll\('([^']+)'\)\)\.find\(el => el\.textContent\.includes\('([^']+)'\)\)/);
-    if (m) {
-      const selector = m[1];
-      const text = m[2];
-      if (selector === '*') {
-        return `cy.contains('${text}')`;
-      } else {
-        return `cy.get('${selector}').contains('${text}')`;
-      }
-    }
-    
-    // Array.from(document.querySelectorAll('tag')).find(el => el.textContent.includes('text'))
-    m = expr.match(/Array\.from\(document\.querySelectorAll\('([a-zA-Z][a-zA-Z0-9-]*)'\)\)\.find\(el => el\.textContent\.includes\('([^']+)'\)\)/);
-    if (m) {
-      const tag = m[1];
-      const text = m[2];
-      return `cy.contains('${tag}', '${text}')`;
-    }
-    
-    // Агрессивные JS селекторы - создаем простой fallback
-    if (expr.includes('(()=>{') || expr.includes('document.querySelector') || expr.includes('Array.from')) {
-      // Для агрессивных селекторов возвращаем базовый селектор
-      return 'cy.get("body")';
-    }
-    
-    // Любая другая форма: пробуем вытащить document.querySelector('...')
-    m = expr.match(/document\.querySelector\((['"])(.+?)\1\)/);
-    if (m) {
-      const sel = m[2];
-      return `cy.get('${sel}')`;
-    }
-    
-     return 'cy.get("body")';
-  }
-
-  function convertCypressToJsBase(cyExpr){
-    if (!cyExpr || typeof cyExpr !== 'string') return 'document.body';
-    let expr = cyExpr.trim().replace(/;\s*$/, '');
-    
-    // Проверяем, является ли это агрессивным JS селектором
-    if (expr.includes('(()=>{') || expr.includes('document.querySelector') || expr.includes('Array.from')) {
-      // Это уже JS селектор, возвращаем как есть
-      return expr;
-    }
-    
-    // cy.get('sel')
-    let m = expr.match(/^cy\.get\((['"])(.+?)\1\)$/);
-    if (m) {
-      const sel = __escapeJsString(m[2]);
-      return `document.querySelector('${sel}')`;
-    }
-    
-    // cy.contains('text')
-    m = expr.match(/^cy\.contains\((['"])(.+?)\1\)$/);
-    if (m) {
-      const txt = __escapeJsString(m[2]);
-      return `Array.from(document.querySelectorAll('*')).find(el => el && el.textContent && el.textContent.includes('${txt}'))`;
-    }
-    
-    // cy.contains('tag', 'text')
-    m = expr.match(/^cy\.contains\((['"])([a-zA-Z][a-zA-Z0-9-]*)\1,\s*(['"])(.+?)\3\)$/);
-    if (m) {
-      const tag = m[2].toLowerCase();
-      const txt = __escapeJsString(m[4]);
-      return `Array.from(document.querySelectorAll('${tag}')).find(el => el && el.textContent && el.textContent.includes('${txt}'))`;
-    }
-    
-    // cy.get('sel').contains('text')
-    m = expr.match(/^cy\.get\((['"])(.+?)\1\)\.contains\((['"])(.+?)\3\)$/);
-    if (m) {
-      const sel = __escapeJsString(m[2]);
-      const txt = __escapeJsString(m[4]);
-      return `Array.from(document.querySelectorAll('${sel}')).find(el => el && el.textContent && el.textContent.includes('${txt}'))`;
-    }
-    
-    // cy.get('sel').contains('tag','text')
-    m = expr.match(/^cy\.get\((['"])(.+?)\1\)\.contains\((['"])([a-zA-Z][a-zA-Z0-9-]*)\3,\s*(['"])(.+?)\5\)$/);
-    if (m) {
-      const scope = __escapeJsString(m[2]);
-      const tag = m[4].toLowerCase();
-      const txt = __escapeJsString(m[6]);
-      return `Array.from((document.querySelector('${scope}')||document).querySelectorAll('${tag}')).find(el => el && el.textContent && el.textContent.includes('${txt}'))`;
-    }
-    
-    // cy.get('sel').filter(':visible').contains('text')
-    m = expr.match(/^cy\.get\((['"])(.+?)\1\)\.filter\('\:visible'\)\.contains\((['"])(.+?)\3\)$/);
-    if (m) {
-      const sel = __escapeJsString(m[2]);
-       const txt = __escapeJsString(m[4]);
-      return `Array.from(document.querySelectorAll('${sel}')).filter(el => el && el.offsetParent !== null).find(el => el.textContent && el.textContent.includes('${txt}'))`;
-    }
-    
-    // cy.get('sel').filter(':visible').contains('tag','text')
-    m = expr.match(/^cy\.get\((['"])(.+?)\1\)\.filter\('\:visible'\)\.contains\((['"])([a-zA-Z][a-zA-Z0-9-]*)\3,\s*(['"])(.+?)\5\)$/);
-    if (m) {
-      const scope = __escapeJsString(m[2]);
-      const tag = m[4].toLowerCase();
-      const txt = __escapeJsString(m[6]);
-      return `Array.from((document.querySelector('${scope}')||document).querySelectorAll('${tag}')).filter(el => el && el.offsetParent !== null).find(el => el.textContent && el.textContent.includes('${txt}'))`;
-    }
-    
-    // cy.get('sel').find('sub').eq(n)
-    m = expr.match(/^cy\.get\((['"])(.+?)\1\)\.find\((['"])(.+?)\3\)\.eq\((\d+)\)$/);
-    if (m) {
-      const scope = __escapeJsString(m[2]);
-      const sub = __escapeJsString(m[4]);
-      const idx = Number(m[5]) || 0;
-      return `Array.from((document.querySelector('${scope}')||document).querySelectorAll('${sub}'))[${idx}]`;
-    }
-    
-    // cy.get('sel').find('sub')
-    m = expr.match(/^cy\.get\((['"])(.+?)\1\)\.find\((['"])(.+?)\3\)$/);
-    if (m) {
-      const scope = __escapeJsString(m[2]);
-      const sub = __escapeJsString(m[4]);
-      return `(document.querySelector('${scope}')||document).querySelector('${sub}')`;
-    }
-    
-    // Любая другая форма: пробуем вытащить первый cy.get('...')
-    m = expr.match(/cy\.get\((['"])(.+?)\1\)/);
-    if (m) {
-      const sel = __escapeJsString(m[2]);
-      return `document.querySelector('${sel}')`;
-    }
-    
-    return 'document.body';
-  }
+  // Address Layer: старые конвертеры селекторов удалены - заменены на addressToSelector
   
   // =========================================================================
-  // РАЗДЕЛ 8: ИНИЦИАЛИЗАЦИЯ И ОЧИСТКА
+  // РАЗДЕЛ 10: ИНИЦИАЛИЗАЦИЯ И ОЧИСТКА
   // =========================================================================
   
   // --- Функция уничтожения/закрытия ---
